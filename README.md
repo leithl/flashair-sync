@@ -1,8 +1,8 @@
 # FlashAir Sync
 
-Automatically syncs engine monitor CSV files from a **Toshiba FlashAir** SD card to a remote server via a Raspberry Pi.
+Automatically syncs engine monitor CSV files from a **Toshiba FlashAir** SD card to a remote server via a Raspberry Pi (or anything that can run python and has wifi.)
 
-The Pi polls for the FlashAir WiFi network every minute. When the nearby card powers on, the Pi detects it, connects, downloads new CSV files, reconnects to home WiFi, and SCPs the files to a remote server — all hands-free.
+The Pi polls for the FlashAir WiFi network every minute. When the nearby card powers on, the Pi detects it, connects, downloads new CSV files, reconnects to the original WiFi, and SCPs the files to a remote server — all hands-free.
 
 Designed to feed into [savvy-upload](https://github.com/leithl/savvy-uploader), which then uploads the CSVs to SavvyAviation.com.
 
@@ -34,11 +34,15 @@ If the script crashes mid-sync while on FlashAir WiFi, a `try/finally` ensures i
 
 ```bash
 # On the Pi
-mkdir -p ~/flashair-sync
-# Copy flashair_sync.py, flashair_cron.sh, and .env.example to ~/flashair-sync/
+git clone https://github.com/leithl/flashair-sync.git
 ```
 
 ### 2. Create Python virtual environment
+
+If you haven't installed it yet
+```bash
+apt-get install python3-venv
+```
 
 ```bash
 cd ~/flashair-sync
@@ -56,7 +60,7 @@ Connect to the FlashAir WiFi manually and browse to the card to find where your 
 curl "http://192.168.0.1/command.cgi?op=100&DIR=/"
 ```
 
-Look for the directory containing `log_YYYYMMDD_HHMMSS_KXXX.csv` files. Common locations: `/`, `/DATA/`, `/GARMIN/`. That directory path goes into `FLASHAIR_DIR` in your `.env`.
+Look for the directory containing `log_YYYYMMDD_HHMMSS_KXXX.csv` files. Common locations: `/`, `/data_log/`, `/DATA/`, `/GARMIN/`. That directory path goes into `FLASHAIR_DIR` in your `.env`.
 
 ### 4. Set up SSH keys (Pi → remote server)
 
