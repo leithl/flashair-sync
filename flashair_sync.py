@@ -523,14 +523,19 @@ def scp_files(cfg: Config, local_paths: list[str]) -> int:
 # Main
 # ---------------------------------------------------------------------------
 
-def run(resync: bool = False) -> None:
+def run(resync: bool = False, _lock=None) -> None:
     cfg = load_config()
 
-    # Acquire exclusive lock (prevents overlapping cron runs)
-    lock = acquire_lock()
-    if not lock:
-        log.debug("Another instance is running, exiting.")
-        return
+    # Acquire exclusive lock (prevents overlapping cron runs).
+    # In daemon mode the caller holds the lock for us (_lock is set).
+    own_lock = _lock is None
+    if own_lock:
+        lock = acquire_lock()
+        if not lock:
+            log.debug("Another instance is running, exiting.")
+            return
+    else:
+        lock = _lock
 
     try:
         iface = cfg.wifi_interface
@@ -594,8 +599,10 @@ def run(resync: bool = False) -> None:
                 reconnect_home(cfg, net_id)
 
         # --- Phase 2: SCP any un-transferred local files ---
+        did_work = False
         to_scp = pending_scp_files(cfg.local_csv_dir, load_last_scpd())
         if to_scp:
+            did_work = True
             log.info(f"{len(to_scp)} file(s) pending SCP.")
             scp_files(cfg, to_scp)
         else:
@@ -606,10 +613,14 @@ def run(resync: bool = False) -> None:
         if wm:
             cleanup_local(cfg.local_csv_dir, wm)
 
-        log.info("Sync complete.")
+        if did_work or (already_on_flashair or net_id is not None):
+            log.info("Sync complete.")
+        else:
+            log.debug("Sync complete (no-op).")
 
     finally:
-        release_lock(lock)
+        if own_lock:
+            release_lock(lock)
 
 
 def run_daemon(resync_first: bool = False) -> None:
@@ -617,26 +628,36 @@ def run_daemon(resync_first: bool = False) -> None:
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
+    # Hold the lock for the daemon's entire lifetime — avoids a lock-file
+    # write every cycle and prevents cron from running simultaneously.
+    lock = acquire_lock()
+    if not lock:
+        log.error("Another instance is already running, exiting.")
+        return
+
     poll = _poll_seconds()
     cooldown = _cooldown_minutes()
     log.info("Starting flashair-sync daemon (poll every %ds, cooldown %dm)", poll, cooldown)
 
-    first = True
-    while not _shutdown:
-        try:
-            run(resync=(resync_first and first))
-            first = False
-        except Exception:
-            log.exception("Unexpected error during sync cycle")
+    try:
+        first = True
+        while not _shutdown:
+            try:
+                run(resync=(resync_first and first), _lock=lock)
+                first = False
+            except Exception:
+                log.exception("Unexpected error during sync cycle")
 
-        remaining = _remaining_cooldown_seconds()
-        if remaining > 0:
-            log.debug("In cooldown, sleeping %.0fs", remaining)
-            _interruptible_sleep(remaining)
-        else:
-            _interruptible_sleep(poll)
+            remaining = _remaining_cooldown_seconds()
+            if remaining > 0:
+                log.debug("In cooldown, sleeping %.0fs", remaining)
+                _interruptible_sleep(remaining)
+            else:
+                _interruptible_sleep(poll)
 
-    log.info("Daemon stopped.")
+        log.info("Daemon stopped.")
+    finally:
+        release_lock(lock)
 
 
 def main():
