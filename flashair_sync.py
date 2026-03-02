@@ -593,8 +593,14 @@ def run(resync: bool = False, _lock=None) -> bool:
                         if downloaded:
                             newest = max(Path(p).name for p in downloaded)
                             save_last_synced(newest)
-                            _touch_cooldown()
-                            log.info(f"Cooldown set ({_cooldown_minutes()}m).")
+                            if len(downloaded) == len(new_files):
+                                _touch_cooldown()
+                                log.info(f"Cooldown set ({_cooldown_minutes()}m).")
+                            else:
+                                log.warning(
+                                    "Downloaded %d/%d file(s); will retry remaining on next cycle.",
+                                    len(downloaded), len(new_files),
+                                )
             finally:
                 reconnect_home(cfg, net_id)
 
