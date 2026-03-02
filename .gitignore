@@ -1,0 +1,7 @@
+.env
+venv/
+csvs/
+*.log
+.lock
+.last_sync
+flashair_sync_macos.py
