@@ -504,7 +504,11 @@ def scp_files(cfg: Config, local_paths: list[str]) -> int:
             path, dest,
         ]
         log.info(f"SCP {fname} → {cfg.remote_host}:{cfg.remote_dir}/")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            log.error(f"SCP timed out for {fname}")
+            break
         if result.returncode == 0:
             transferred += 1
             last_ok = fname
