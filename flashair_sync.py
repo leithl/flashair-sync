@@ -25,13 +25,15 @@ Configuration (.env file in the same directory as this script):
     SSH_KEY_PATH=~/.ssh/id_ed25519      SSH private key (default: ~/.ssh/id_ed25519)
     WIFI_INTERFACE=wlan0                WiFi interface (default: wlan0)
     COOLDOWN_MINUTES=30                 Minutes to wait before re-checking FlashAir (default: 30)
+    POLL_SECONDS=60                     Daemon poll interval in seconds (default: 60)
 
     # Managed by the script (do not edit)
     LAST_SYNCED=                        Watermark — filename of last downloaded CSV
     LAST_SCPD=                          Watermark — filename of last SCP'd CSV
 
 Usage:
-    python3 flashair_sync.py            # Normal sync (run via cron every minute)
+    python3 flashair_sync.py            # One-shot sync (for cron)
+    python3 flashair_sync.py --daemon   # Long-running daemon (for systemd)
     python3 flashair_sync.py --resync   # Re-download all files
     python3 flashair_sync.py -v         # Verbose logging
 """
@@ -40,6 +42,7 @@ import argparse
 import fcntl
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -57,6 +60,7 @@ CONNECT_TIMEOUT = 30
 FLASHAIR_HTTP_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 120
 COOLDOWN_MINUTES_DEFAULT = 30
+POLL_SECONDS_DEFAULT = 60
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +219,44 @@ def _in_cooldown() -> bool:
 def _touch_cooldown() -> None:
     """Record that a successful download just happened."""
     _COOLDOWN_PATH.touch()
+
+
+# ---------------------------------------------------------------------------
+# Daemon helpers
+# ---------------------------------------------------------------------------
+
+_shutdown = False
+
+
+def _signal_handler(signum, _frame):
+    global _shutdown
+    log.info("Received signal %s, shutting down...", signum)
+    _shutdown = True
+
+
+def _poll_seconds() -> int:
+    """Return the configured daemon poll interval in seconds."""
+    val = os.environ.get("POLL_SECONDS", "") or _read_env().get("POLL_SECONDS", "")
+    try:
+        return int(val) if val else POLL_SECONDS_DEFAULT
+    except ValueError:
+        return POLL_SECONDS_DEFAULT
+
+
+def _remaining_cooldown_seconds() -> float:
+    """Return seconds left in the cooldown period (0 if not in cooldown)."""
+    if not _COOLDOWN_PATH.exists():
+        return 0
+    age = time.time() - _COOLDOWN_PATH.stat().st_mtime
+    remaining = (_cooldown_minutes() * 60) - age
+    return max(0, remaining)
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Sleep for *seconds*, waking early if a shutdown signal arrives."""
+    deadline = time.time() + seconds
+    while not _shutdown and time.time() < deadline:
+        time.sleep(min(1.0, deadline - time.time()))
 
 
 # ---------------------------------------------------------------------------
@@ -570,9 +612,40 @@ def run(resync: bool = False) -> None:
         release_lock(lock)
 
 
+def run_daemon(resync_first: bool = False) -> None:
+    """Run as a long-lived daemon, polling on a dynamic interval."""
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    poll = _poll_seconds()
+    cooldown = _cooldown_minutes()
+    log.info("Starting flashair-sync daemon (poll every %ds, cooldown %dm)", poll, cooldown)
+
+    first = True
+    while not _shutdown:
+        try:
+            run(resync=(resync_first and first))
+            first = False
+        except Exception:
+            log.exception("Unexpected error during sync cycle")
+
+        remaining = _remaining_cooldown_seconds()
+        if remaining > 0:
+            log.debug("In cooldown, sleeping %.0fs", remaining)
+            _interruptible_sleep(remaining)
+        else:
+            _interruptible_sleep(poll)
+
+    log.info("Daemon stopped.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Sync engine monitor CSVs from a FlashAir SD card"
+    )
+    parser.add_argument(
+        "--daemon", action="store_true",
+        help="Run as a long-lived daemon instead of one-shot",
     )
     parser.add_argument(
         "--resync", action="store_true",
@@ -590,7 +663,10 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    run(resync=args.resync)
+    if args.daemon:
+        run_daemon(resync_first=args.resync)
+    else:
+        run(resync=args.resync)
 
 
 if __name__ == "__main__":
