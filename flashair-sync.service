@@ -1,0 +1,16 @@
+[Unit]
+Description=FlashAir SD Card Sync Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/flashair-sync
+ExecStart=/home/pi/flashair-sync/venv/bin/python /home/pi/flashair-sync/flashair_sync.py --daemon
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

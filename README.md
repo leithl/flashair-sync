@@ -2,13 +2,15 @@
 
 Automatically syncs engine monitor CSV files from a **Toshiba FlashAir** SD card to a remote server via a Raspberry Pi (or anything that can run python and has wifi.)
 
-The Pi polls for the FlashAir WiFi network every minute. When the nearby card powers on, the Pi detects it, connects, downloads new CSV files, reconnects to the original WiFi, and SCPs the files to a remote server — all hands-free.
+The Pi polls for the FlashAir WiFi network. When the nearby card powers on, the Pi detects it, connects, downloads new CSV files, reconnects to the original WiFi, and SCPs the files to a remote server — all hands-free.
+
+Can run as a **systemd service** (recommended) or via **cron**.
 
 Designed to feed into [savvy-upload](https://github.com/leithl/savvy-uploader), which then uploads the CSVs to SavvyAviation.com.
 
 ## How It Works
 
-1. **Poll** — Cron runs the script every minute. It triggers a WiFi scan via `wpa_cli`.
+1. **Poll** — The script runs periodically (as a systemd service or via cron). It triggers a WiFi scan via `wpa_cli`.
 2. **Detect** — If the FlashAir SSID is not visible, the script exits immediately (takes ~5 seconds).
 3. **Connect** — FlashAir detected: the script adds a temporary WiFi network and connects.
 4. **Download** — Lists files on the card via the FlashAir HTTP API (`command.cgi`). Downloads any CSVs newer than the watermark (`LAST_SYNCED`).
@@ -16,9 +18,9 @@ Designed to feed into [savvy-upload](https://github.com/leithl/savvy-uploader), 
 6. **Transfer** — SCPs the new files to the remote server.
 7. **Cleanup** — Deletes old local CSVs, keeping the 10 most recent.
 
-A file lock prevents overlapping cron runs. If a sync takes 3 minutes, the next cron invocations exit silently until it finishes.
+A file lock prevents concurrent runs. If the script is triggered while another instance is active, the new invocation exits silently.
 
-If the script crashes mid-sync while on FlashAir WiFi, a `try/finally` ensures it always attempts to reconnect home. On the next run, if the Pi is disconnected, it reconnects before doing anything else.
+If the script crashes mid-sync while on FlashAir WiFi, a `try/finally` ensures it always attempts to reconnect home. On the next cycle, if the Pi is disconnected, it reconnects before doing anything else.
 
 ## Requirements
 
@@ -84,7 +86,7 @@ Replace `USER` and `REMOTE_HOST` with your actual values.
 ```bash
 cd ~/flashair-sync
 cp .env.example .env
-nano .env
+vi .env
 ```
 
 Fill in all required values:
@@ -112,7 +114,34 @@ cd ~/flashair-sync
 
 If the FlashAir is not nearby, you should see `FlashAir 'xxx' not in range.` and the script exits. If it is nearby, you should see the full sync cycle.
 
-### 7. Set up cron
+### 7. Set up scheduling
+
+Choose **one** of the following. Both work; the systemd service is recommended as it's lighter and has built-in log management.
+
+#### Option A: systemd service (recommended)
+
+```bash
+# Copy the unit file
+sudo cp ~/flashair-sync/flashair-sync.service /etc/systemd/system/
+
+# Edit paths/user if you're not using the default pi user:
+sudo vi /etc/systemd/system/flashair-sync.service
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable flashair-sync
+sudo systemctl start flashair-sync
+
+# Check status
+systemctl status flashair-sync
+
+# View logs
+journalctl -u flashair-sync -f
+```
+
+The daemon polls every 60 seconds by default (configurable via `POLL_SECONDS` in `.env`). After a successful download it sleeps for the full cooldown period before polling again.
+
+#### Option B: cron
 
 ```bash
 crontab -e
@@ -157,6 +186,7 @@ sudo crontab -e
 | `SSH_KEY_PATH` | No | `~/.ssh/id_ed25519` | Path to SSH private key |
 | `WIFI_INTERFACE` | No | `wlan0` | WiFi interface name |
 | `COOLDOWN_MINUTES` | No | `30` | Minutes to wait before re-checking FlashAir |
+| `POLL_SECONDS` | No | `60` | Daemon poll interval in seconds |
 | `LAST_SYNCED` | — | — | Managed by script. Last downloaded filename. |
 | `LAST_SCPD` | — | — | Managed by script. Last SCP'd filename. |
 
@@ -187,8 +217,9 @@ sudo crontab -e
 ## Files
 
 ```
-flashair_sync.py    Main script
-flashair_cron.sh    Shell wrapper for cron
+flashair_sync.py        Main script (one-shot and daemon modes)
+flashair-sync.service   systemd unit file
+flashair_cron.sh        Shell wrapper for cron
 .env                Configuration (not in git)
 .env.example        Example configuration
 .gitignore          Git exclusions
