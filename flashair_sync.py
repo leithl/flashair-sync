@@ -523,7 +523,7 @@ def scp_files(cfg: Config, local_paths: list[str]) -> int:
 # Main
 # ---------------------------------------------------------------------------
 
-def run(resync: bool = False, _lock=None) -> None:
+def run(resync: bool = False, _lock=None) -> bool:
     cfg = load_config()
 
     # Acquire exclusive lock (prevents overlapping cron runs).
@@ -533,7 +533,7 @@ def run(resync: bool = False, _lock=None) -> None:
         lock = acquire_lock()
         if not lock:
             log.debug("Another instance is running, exiting.")
-            return
+            return False
     else:
         lock = _lock
 
@@ -600,11 +600,14 @@ def run(resync: bool = False, _lock=None) -> None:
 
         # --- Phase 2: SCP any un-transferred local files ---
         did_work = False
+        scp_ok = True
+        transferred = 0
         to_scp = pending_scp_files(cfg.local_csv_dir, load_last_scpd())
         if to_scp:
             did_work = True
             log.info(f"{len(to_scp)} file(s) pending SCP.")
-            scp_files(cfg, to_scp)
+            transferred = scp_files(cfg, to_scp)
+            scp_ok = (transferred == len(to_scp))
         else:
             log.debug("No files pending SCP.")
 
@@ -613,10 +616,15 @@ def run(resync: bool = False, _lock=None) -> None:
         if wm:
             cleanup_local(cfg.local_csv_dir, wm)
 
-        if did_work or (already_on_flashair or net_id is not None):
+        if not scp_ok:
+            log.warning("Sync complete (SCP incomplete, %d/%d transferred).",
+                        transferred, len(to_scp))
+        elif did_work or (already_on_flashair or net_id is not None):
             log.info("Sync complete.")
         else:
             log.debug("Sync complete (no-op).")
+
+        return not scp_ok
 
     finally:
         if own_lock:
@@ -642,18 +650,23 @@ def run_daemon(resync_first: bool = False) -> None:
     try:
         first = True
         while not _shutdown:
+            needs_retry = False
             try:
-                run(resync=(resync_first and first), _lock=lock)
+                needs_retry = run(resync=(resync_first and first), _lock=lock)
                 first = False
             except Exception:
                 log.exception("Unexpected error during sync cycle")
 
-            remaining = _remaining_cooldown_seconds()
-            if remaining > 0:
-                log.debug("In cooldown, sleeping %.0fs", remaining)
-                _interruptible_sleep(remaining)
-            else:
+            if needs_retry:
+                log.info("SCP incomplete, retrying in %ds", poll)
                 _interruptible_sleep(poll)
+            else:
+                remaining = _remaining_cooldown_seconds()
+                if remaining > 0:
+                    log.debug("In cooldown, sleeping %.0fs", remaining)
+                    _interruptible_sleep(remaining)
+                else:
+                    _interruptible_sleep(poll)
 
         log.info("Daemon stopped.")
     finally:
