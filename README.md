@@ -155,7 +155,24 @@ Add this line to poll every minute:
 
 The lock file prevents overlapping runs, so polling every minute is safe even if a sync takes several minutes.
 
-### 8. (Optional) Verify wpa_cli permissions
+### 8. (Optional) Reduce SD card writes
+
+The daemon itself produces zero disk writes on no-op cycles, but `wpa_supplicant` may log WiFi scan events to the journal. To suppress these:
+
+```bash
+sudo mkdir -p /etc/systemd/system/wpa_supplicant.service.d
+cat <<'EOF' | sudo tee /etc/systemd/system/wpa_supplicant.service.d/log-level.conf
+[Service]
+ExecStart=
+ExecStart=/sbin/wpa_supplicant -u -s -O /run/wpa_supplicant -c /etc/wpa_supplicant/wpa_supplicant.conf -i wlan0 -f /dev/null
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart wpa_supplicant
+```
+
+For broader SD card protection, set `Storage=volatile` in `/etc/systemd/journald.conf` to keep the journal in RAM only. Logs remain queryable via `journalctl` while the Pi is running but are lost on reboot.
+
+### 9. (Optional) Verify wpa_cli permissions
 
 The script uses `wpa_cli` to scan and switch WiFi networks. On most Raspberry Pi OS installs, the default user can run `wpa_cli` without `sudo`. If you get permission errors:
 
@@ -220,11 +237,11 @@ sudo crontab -e
 flashair_sync.py        Main script (one-shot and daemon modes)
 flashair-sync.service   systemd unit file
 flashair_cron.sh        Shell wrapper for cron
-.env                Configuration (not in git)
-.env.example        Example configuration
-.gitignore          Git exclusions
-.lock               Lock file (auto-created, not in git)
-csvs/               Downloaded CSVs (auto-created, not in git)
-venv/               Python virtual environment (not in git)
-sync.log            Cron output log (not in git)
+.env                    Configuration (not in git)
+.env.example            Example configuration
+.gitignore              Git exclusions
+.lock                   Lock file (auto-created, not in git)
+csvs/                   Downloaded CSVs (auto-created, not in git)
+venv/                   Python virtual environment (not in git)
+sync.log                Cron output log (not in git)
 ```
