@@ -467,39 +467,59 @@ def filter_stable_files(
 
 def find_grown_recent_files(
     ip: str, directory: str,
-    local_dir: str, lookback: int = FLASHAIR_LOOKBACK_FILES,
+    local_dir: str, previous_watermark: str,
+    lookback: int = FLASHAIR_LOOKBACK_FILES,
 ) -> list[tuple[str, int, int]]:
-    """Belt & braces: check the most recent local files for size drift.
+    """Belt & braces: re-check the previous-watermark file and N files
+    before it for size drift.
 
-    If the stability check above ever lets a file slip through during a
-    flush gap, the partial sits in the local Pi dir AND has been SCP'd
-    downstream. On the very next sync the file should be bigger on
-    FlashAir than locally — that's the smoking gun. We re-pull and let
-    the caller rename so it doesn't collide with the partial downstream.
+    The relevant window is anchored at the PREVIOUS watermark — the most
+    recent file flashair-sync had synced before this run. That's where the
+    last partial would live: if the avionics was actively writing it when
+    we previously polled, the partial is what got SCP'd downstream, and
+    by now (next sync, post engine-off) the FlashAir version will be
+    bigger. Looking at "the last 5 local files" instead would miss this
+    case after a multi-day trip — by the time the plane returns, the
+    most recent local files are the brand-new trip files, and the
+    partial-departure file is N+ back from the head of the list.
+
+    Layer 2 runs BEFORE cleanup_local, so the partial's local copy is
+    still present and the size compare is direct (no need to SSH the
+    downstream host).
 
     Returns [(filename, local_size, remote_size), ...] for files whose
     FlashAir version is larger than what we have locally.
     """
+    if not previous_watermark:
+        return []
     p = Path(local_dir)
     if not p.is_dir():
-        return []
-    local_csvs = sorted(p.glob("log_*_*.csv"), key=lambda f: f.name, reverse=True)
-    recent = local_csvs[:lookback]
-    if not recent:
         return []
     try:
         flashair = list_flashair_files_with_sizes(ip, directory)
     except Exception as e:
         log.warning(f"lookback: could not list FlashAir: {e}")
         return []
+    fa_sorted = sorted(flashair.keys())
+    try:
+        idx = fa_sorted.index(previous_watermark)
+    except ValueError:
+        log.info(f"lookback: prev watermark {previous_watermark!r} no longer on FlashAir; skipping")
+        return []
+    # Take the watermark + lookback files before it
+    start = max(0, idx - lookback)
+    candidates = fa_sorted[start:idx + 1]
     grown = []
-    for f in recent:
-        remote_size = flashair.get(f.name)
-        if remote_size is None:
-            continue  # gone from FlashAir (cleared SD?), nothing to compare
-        local_size = f.stat().st_size
+    for fname in candidates:
+        local_path = p / fname
+        if not local_path.exists():
+            # Cleanup already removed it (shouldn't happen — we run before
+            # cleanup_local — but be defensive).
+            continue
+        local_size = local_path.stat().st_size
+        remote_size = flashair[fname]
         if remote_size > local_size:
-            grown.append((f.name, local_size, remote_size))
+            grown.append((fname, local_size, remote_size))
     return grown
 
 
@@ -678,27 +698,36 @@ def run(resync: bool = False, _lock=None) -> bool:
                     log.info(f"Found {len(remote_files)} CSV(s) on FlashAir.")
 
                     watermark = "" if resync else load_last_synced()
+                    previous_watermark = watermark  # captured before any save_last_synced
                     new_files, skipped = collect_new_files(remote_files, watermark)
 
                     if skipped:
                         log.info(f"Skipped {len(skipped)} already-synced file(s).")
 
-                    # Skip files that are still being written by the
-                    # avionics. Without this guard we'd grab a partial
-                    # snapshot (e.g. 34 sec of pre-flight engine warmup
-                    # captured as the start of a 2-hour flight), the
-                    # watermark would advance past it, and we'd never re-pull
-                    # the complete file. The next sync cycle will re-check
-                    # any file we skip here.
+                    # Skip the file that's still being written by the
+                    # avionics. Only the most recent CSV on the SD card can
+                    # be the active one (avionics writes serially: it
+                    # closes file N before opening file N+1). So the
+                    # stability check only needs to run on the newest
+                    # candidate; everything older is already closed.
+                    #
+                    # Without this guard we'd grab a partial snapshot
+                    # (e.g. 34 sec of pre-flight engine warmup captured as
+                    # the start of a 2-hour flight), the watermark would
+                    # advance past it, and we'd never re-pull the
+                    # complete file. Next sync re-checks any file we
+                    # defer here.
                     if new_files:
-                        new_files, unstable = filter_stable_files(
-                            cfg.flashair_ip, cfg.flashair_dir, new_files,
+                        newest = new_files[-1]  # new_files is sorted
+                        stable, unstable = filter_stable_files(
+                            cfg.flashair_ip, cfg.flashair_dir, [newest],
                         )
                         if unstable:
                             log.info(
-                                f"Deferring {len(unstable)} actively-written "
-                                f"file(s) until they stop growing: {unstable}"
+                                f"Deferring actively-written file: {unstable[0]} "
+                                f"(will retry next cycle)"
                             )
+                            new_files = new_files[:-1]  # all but the unstable one
 
                     if not new_files:
                         log.info("No new files to download.")
@@ -730,11 +759,14 @@ def run(resync: bool = False, _lock=None) -> bool:
 
                     # Lookback pass: catch any partials the stability check
                     # may have let slip through (e.g. flush-gap false stable).
-                    # For each of the last N local files, if FlashAir's
-                    # version is larger, re-download under a `_rescue`
-                    # name so it doesn't collide downstream.
+                    # Anchor at previous_watermark (the file we synced just
+                    # before THIS sync) and re-check it + N files before it.
+                    # If FlashAir's version is larger than our local copy,
+                    # re-download under a `_rescue` name so it doesn't
+                    # collide downstream.
                     grown = find_grown_recent_files(
                         cfg.flashair_ip, cfg.flashair_dir, cfg.local_csv_dir,
+                        previous_watermark,
                     )
                     for fname, lsize, rsize in grown:
                         log.warning(
