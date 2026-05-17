@@ -414,10 +414,18 @@ def list_flashair_files_with_sizes(ip: str, directory: str) -> dict[str, int]:
 
 
 # How long to wait between size polls to confirm a file has stopped growing.
-# At 1 Hz logging, an in-progress CSV grows by ~50 bytes per second; a few
-# seconds of stillness is enough to be confident the avionics has stopped
-# writing. Configurable so the daemon can shorten this in tests.
-FLASHAIR_STABILITY_DELAY_SEC = int(os.environ.get("FLASHAIR_STABILITY_DELAY_SEC", "10"))
+# The avionics logs at 1 Hz but may buffer writes and flush in chunks (we
+# don't have firm timing — could be every second or every minute). Default
+# of 90 sec is conservative enough to span any reasonable flush interval.
+# Configurable for tests.
+FLASHAIR_STABILITY_DELAY_SEC = int(os.environ.get("FLASHAIR_STABILITY_DELAY_SEC", "90"))
+
+# How many recently-synced local files to re-check on every cycle. Belt &
+# braces against the stability check returning a false "stable" during a
+# flush gap — if any of the last N files grew on FlashAir since we pulled
+# them, re-download (and rename, to avoid colliding with the partial that
+# the downstream pipeline may have already accepted).
+FLASHAIR_LOOKBACK_FILES = int(os.environ.get("FLASHAIR_LOOKBACK_FILES", "5"))
 
 
 def filter_stable_files(
@@ -455,6 +463,44 @@ def filter_stable_files(
         else:
             unstable.append(f)
     return stable, unstable
+
+
+def find_grown_recent_files(
+    ip: str, directory: str,
+    local_dir: str, lookback: int = FLASHAIR_LOOKBACK_FILES,
+) -> list[tuple[str, int, int]]:
+    """Belt & braces: check the most recent local files for size drift.
+
+    If the stability check above ever lets a file slip through during a
+    flush gap, the partial sits in the local Pi dir AND has been SCP'd
+    downstream. On the very next sync the file should be bigger on
+    FlashAir than locally — that's the smoking gun. We re-pull and let
+    the caller rename so it doesn't collide with the partial downstream.
+
+    Returns [(filename, local_size, remote_size), ...] for files whose
+    FlashAir version is larger than what we have locally.
+    """
+    p = Path(local_dir)
+    if not p.is_dir():
+        return []
+    local_csvs = sorted(p.glob("log_*_*.csv"), key=lambda f: f.name, reverse=True)
+    recent = local_csvs[:lookback]
+    if not recent:
+        return []
+    try:
+        flashair = list_flashair_files_with_sizes(ip, directory)
+    except Exception as e:
+        log.warning(f"lookback: could not list FlashAir: {e}")
+        return []
+    grown = []
+    for f in recent:
+        remote_size = flashair.get(f.name)
+        if remote_size is None:
+            continue  # gone from FlashAir (cleared SD?), nothing to compare
+        local_size = f.stat().st_size
+        if remote_size > local_size:
+            grown.append((f.name, local_size, remote_size))
+    return grown
 
 
 def download_file(ip: str, directory: str, filename: str, local_dir: str) -> str:
@@ -681,6 +727,39 @@ def run(resync: bool = False, _lock=None) -> bool:
                                     "Downloaded %d/%d file(s); will retry remaining on next cycle.",
                                     len(downloaded), len(new_files),
                                 )
+
+                    # Lookback pass: catch any partials the stability check
+                    # may have let slip through (e.g. flush-gap false stable).
+                    # For each of the last N local files, if FlashAir's
+                    # version is larger, re-download under a `_rescue`
+                    # name so it doesn't collide downstream.
+                    grown = find_grown_recent_files(
+                        cfg.flashair_ip, cfg.flashair_dir, cfg.local_csv_dir,
+                    )
+                    for fname, lsize, rsize in grown:
+                        log.warning(
+                            f"Lookback: {fname} grew on FlashAir "
+                            f"({lsize:,} -> {rsize:,}). Re-downloading."
+                        )
+                        # Run stability check on the grown file too — no
+                        # point re-pulling if it's STILL being written.
+                        stable, _ = filter_stable_files(
+                            cfg.flashair_ip, cfg.flashair_dir, [fname],
+                        )
+                        if not stable:
+                            log.info(f"  still growing, deferring: {fname}")
+                            continue
+                        try:
+                            path = download_file(
+                                cfg.flashair_ip, cfg.flashair_dir,
+                                fname, cfg.local_csv_dir,
+                            )
+                            p = Path(path)
+                            renamed = p.with_name(p.stem + "_rescue" + p.suffix)
+                            p.rename(renamed)
+                            log.info(f"  renamed {p.name} -> {renamed.name}")
+                        except Exception as e:
+                            log.warning(f"  lookback re-download failed for {fname}: {e}")
             finally:
                 reconnect_home(cfg, net_id)
 
