@@ -382,20 +382,79 @@ def list_flashair_files(ip: str, directory: str) -> list[str]:
     Uses the FlashAir command.cgi op=100 directory listing API.
     Returns a sorted list of filenames.
     """
+    return sorted(list_flashair_files_with_sizes(ip, directory).keys())
+
+
+def list_flashair_files_with_sizes(ip: str, directory: str) -> dict[str, int]:
+    """Same as list_flashair_files, but returns {filename: size_bytes}.
+
+    The op=100 output format is:
+        DIR,FILENAME,SIZE,ATTR,DATE,TIME
+    Existing callers discarded SIZE; the stable-file check below needs it.
+    """
     url = f"http://{ip}/command.cgi?op=100&DIR={directory}"
     with urllib.request.urlopen(url, timeout=FLASHAIR_HTTP_TIMEOUT) as resp:
         content = resp.read().decode("utf-8")
 
-    files = []
+    out: dict[str, int] = {}
     for line in content.splitlines():
         if line.startswith("WLANSD_FILELIST"):
             continue
         parts = line.split(",")
-        if len(parts) >= 2:
-            fname = parts[1].strip()
-            if fname.startswith("log_") and fname.lower().endswith(".csv"):
-                files.append(fname)
-    return sorted(files)
+        if len(parts) < 3:
+            continue
+        fname = parts[1].strip()
+        if not (fname.startswith("log_") and fname.lower().endswith(".csv")):
+            continue
+        try:
+            out[fname] = int(parts[2].strip())
+        except ValueError:
+            continue
+    return out
+
+
+# How long to wait between size polls to confirm a file has stopped growing.
+# At 1 Hz logging, an in-progress CSV grows by ~50 bytes per second; a few
+# seconds of stillness is enough to be confident the avionics has stopped
+# writing. Configurable so the daemon can shorten this in tests.
+FLASHAIR_STABILITY_DELAY_SEC = int(os.environ.get("FLASHAIR_STABILITY_DELAY_SEC", "10"))
+
+
+def filter_stable_files(
+    ip: str, directory: str, candidates: list[str],
+    delay_sec: int = FLASHAIR_STABILITY_DELAY_SEC,
+) -> tuple[list[str], list[str]]:
+    """Return (stable, unstable) split of *candidates* based on whether the
+    file's size on FlashAir is unchanged across two polls *delay_sec* apart.
+
+    The avionics keeps writing to the active CSV throughout a flight. If
+    we download it while it's still growing, we capture only the bytes
+    written so far — a partial that Savvy then accepts as "Success (0
+    flights)" because the truncated chunk doesn't contain a complete
+    takeoff+landing cycle.
+
+    Returns:
+        stable:   files whose size was identical in both polls — safe to
+                  download.
+        unstable: files that grew between polls — skip; the next sync
+                  cycle will re-check once the engine is off.
+    """
+    if not candidates:
+        return [], []
+    first = list_flashair_files_with_sizes(ip, directory)
+    time.sleep(delay_sec)
+    second = list_flashair_files_with_sizes(ip, directory)
+    stable, unstable = [], []
+    for f in candidates:
+        s1, s2 = first.get(f), second.get(f)
+        if s1 is None or s2 is None:
+            # File appeared/disappeared mid-check — treat as unstable.
+            unstable.append(f)
+        elif s1 == s2:
+            stable.append(f)
+        else:
+            unstable.append(f)
+    return stable, unstable
 
 
 def download_file(ip: str, directory: str, filename: str, local_dir: str) -> str:
@@ -577,6 +636,23 @@ def run(resync: bool = False, _lock=None) -> bool:
 
                     if skipped:
                         log.info(f"Skipped {len(skipped)} already-synced file(s).")
+
+                    # Skip files that are still being written by the
+                    # avionics. Without this guard we'd grab a partial
+                    # snapshot (e.g. 34 sec of pre-flight engine warmup
+                    # captured as the start of a 2-hour flight), the
+                    # watermark would advance past it, and we'd never re-pull
+                    # the complete file. The next sync cycle will re-check
+                    # any file we skip here.
+                    if new_files:
+                        new_files, unstable = filter_stable_files(
+                            cfg.flashair_ip, cfg.flashair_dir, new_files,
+                        )
+                        if unstable:
+                            log.info(
+                                f"Deferring {len(unstable)} actively-written "
+                                f"file(s) until they stop growing: {unstable}"
+                            )
 
                     if not new_files:
                         log.info("No new files to download.")
