@@ -204,6 +204,7 @@ sudo crontab -e
 | `WIFI_INTERFACE` | No | `wlan0` | WiFi interface name |
 | `COOLDOWN_MINUTES` | No | `30` | Minutes to wait before re-checking FlashAir |
 | `POLL_SECONDS` | No | `60` | Daemon poll interval in seconds |
+| `UFW_RELOAD_ON_RECONNECT` | No | `0` | If `1`, run `sudo ufw reload` after every reconnect to home WiFi. Only useful when this Pi also hosts an AP+STA WiFi bridge that's been hit by UFW's `ufw-after-input` silently dropping inbound DHCP. |
 | `LAST_SYNCED` | — | — | Managed by script. Last downloaded filename. |
 | `LAST_SCPD` | — | — | Managed by script. Last SCP'd filename. |
 

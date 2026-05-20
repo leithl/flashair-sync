@@ -26,6 +26,7 @@ Configuration (.env file in the same directory as this script):
     WIFI_INTERFACE=wlan0                WiFi interface (default: wlan0)
     COOLDOWN_MINUTES=30                 Minutes to wait before re-checking FlashAir (default: 30)
     POLL_SECONDS=60                     Daemon poll interval in seconds (default: 60)
+    UFW_RELOAD_ON_RECONNECT=0           If 1, run `sudo ufw reload` after reconnect_home() (default: 0)
 
     # Managed by the script (do not edit)
     LAST_SYNCED=                        Watermark — filename of last downloaded CSV
