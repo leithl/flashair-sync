@@ -336,6 +336,42 @@ def connect_to_flashair(cfg: Config) -> int:
     return net_id
 
 
+def _maybe_ufw_reload() -> None:
+    """Defensive `sudo ufw reload` after a WiFi swap, if opted in.
+
+    On hosts where this Pi also runs an AP+STA WiFi bridge (e.g. a co-hosted
+    hostapd serving an IoT pairing AP on a virtual interface), swapping
+    wlan0 between SSIDs can leave UFW silently dropping inbound DHCP on the
+    AP interface — UFW's `ufw-after-input` chain drops UDP/67 by default,
+    and per-interface ALLOW rules can drift out of the live iptables when
+    the interface didn't exist at UFW load time. `ufw reload` re-applies
+    user.rules and clears the trap. Idempotent and cheap.
+
+    Opt-in via `UFW_RELOAD_ON_RECONNECT=1` in .env (or env var). Default off
+    so installs without UFW or without the bridge are unaffected. Never
+    fails the caller — UFW issues here are not the daemon's problem.
+    """
+    val = (
+        os.environ.get("UFW_RELOAD_ON_RECONNECT", "")
+        or _read_env().get("UFW_RELOAD_ON_RECONNECT", "")
+    )
+    if val.strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    try:
+        subprocess.run(
+            ["sudo", "-n", "ufw", "reload"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        log.info("ufw reload OK (DHCP-trap defense).")
+    except FileNotFoundError:
+        # No `sudo` / `ufw` on this host — silently skip.
+        pass
+    except subprocess.CalledProcessError as e:
+        log.warning(f"ufw reload failed (exit {e.returncode}): {e.stderr.strip()}")
+    except Exception as e:
+        log.warning(f"ufw reload errored: {e}")
+
+
 def reconnect_home(cfg: Config, net_id: Optional[int] = None) -> None:
     """Disconnect from FlashAir and reconnect to home WiFi."""
     iface = cfg.wifi_interface
@@ -349,10 +385,12 @@ def reconnect_home(cfg: Config, net_id: Optional[int] = None) -> None:
         if get_current_ssid(iface) == cfg.home_ssid:
             log.info(f"Connected to {cfg.home_ssid}")
             time.sleep(3)  # Allow DHCP to settle
+            _maybe_ufw_reload()
             return
         time.sleep(1)
 
     log.warning(f"Could not reconnect to {cfg.home_ssid} within {CONNECT_TIMEOUT}s")
+    _maybe_ufw_reload()
 
 
 def wait_for_flashair(cfg: Config) -> bool:
