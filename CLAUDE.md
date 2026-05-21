@@ -19,6 +19,7 @@ Key mechanisms:
 - **Cooldown** (`.last_sync` file mtime) prevents re-scanning FlashAir for 30 min after a successful download. Only set on *complete* downloads — partial failures retry promptly.
 - **Lock file** (`.lock` with `fcntl.flock`) prevents concurrent runs. Daemon holds lock for its entire lifetime.
 - **Interruptible sleep** — daemon sleeps in 1-second increments so SIGTERM/SIGINT are handled promptly.
+- **LAN status endpoint** (`--daemon` only) — stdlib `http.server.ThreadingHTTPServer` thread serves `GET /status` on `0.0.0.0:STATUS_HTTP_PORT` (default 8765). Returns `{epoch, last_sync_epoch, last_sync_files_n, transferring, current_file}`. Module-level dict + `threading.Lock`; hooks live around the `download_file()` call sites and at the end of the "we reached the card" branch. No auth — LAN only. Cron-only installs (no `--daemon`) don't get this endpoint because there's no long-lived process to host the listener.
 
 ## Files
 

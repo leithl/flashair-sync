@@ -204,8 +204,35 @@ sudo crontab -e
 | `WIFI_INTERFACE` | No | `wlan0` | WiFi interface name |
 | `COOLDOWN_MINUTES` | No | `30` | Minutes to wait before re-checking FlashAir |
 | `POLL_SECONDS` | No | `60` | Daemon poll interval in seconds |
+| `STATUS_HTTP_PORT` | No | `8765` | Port the daemon serves `GET /status` on (LAN only, no auth, daemon mode only). Set to `0` to disable. |
 | `LAST_SYNCED` | — | — | Managed by script. Last downloaded filename. |
 | `LAST_SCPD` | — | — | Managed by script. Last SCP'd filename. |
+
+## Status endpoint
+
+When running in `--daemon` mode the script also serves `GET /status` on `0.0.0.0:8765` (override via `STATUS_HTTP_PORT`). Plain HTTP, no auth — bind it to a trusted LAN only.
+
+Example payload:
+
+```json
+{
+  "epoch": 1779391430,
+  "last_sync_epoch": 1779391429,
+  "last_sync_files_n": 12,
+  "transferring": false,
+  "current_file": null
+}
+```
+
+Fields:
+
+- `epoch` — clock time when this response was generated.
+- `last_sync_epoch` — when the daemon most recently reached the card and processed its files (whether 0 or N were downloaded). `null` until the first such cycle; primed from `.last_sync`'s mtime on daemon restart so the signal survives across restarts.
+- `last_sync_files_n` — count of files actually downloaded in that most-recent reach-the-card cycle (0 if there was nothing new). Resets to `0` across daemon restart.
+- `transferring` — `true` while a `download_file()` call from the FlashAir HTTP API is in-flight.
+- `current_file` — filename being downloaded, else `null`.
+
+Consumers should treat the response as stale if it can't be reached or if `now - epoch > 120s`. The downstream `remote-switch` Pi reads this once per minute and surfaces it on the hangar controller's UI.
 
 ## Troubleshooting
 

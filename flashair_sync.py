@@ -26,6 +26,7 @@ Configuration (.env file in the same directory as this script):
     WIFI_INTERFACE=wlan0                WiFi interface (default: wlan0)
     COOLDOWN_MINUTES=30                 Minutes to wait before re-checking FlashAir (default: 30)
     POLL_SECONDS=60                     Daemon poll interval in seconds (default: 60)
+    STATUS_HTTP_PORT=8765               Port for the LAN status endpoint (default: 8765, --daemon only)
 
     # Managed by the script (do not edit)
     LAST_SYNCED=                        Watermark — filename of last downloaded CSV
@@ -40,15 +41,18 @@ Usage:
 
 import argparse
 import fcntl
+import json
 import logging
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +65,7 @@ FLASHAIR_HTTP_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 120
 COOLDOWN_MINUTES_DEFAULT = 30
 POLL_SECONDS_DEFAULT = 60
+STATUS_HTTP_PORT_DEFAULT = 8765
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +262,111 @@ def _interruptible_sleep(seconds: float) -> None:
     deadline = time.time() + seconds
     while not _shutdown and time.time() < deadline:
         time.sleep(min(1.0, deadline - time.time()))
+
+
+# ---------------------------------------------------------------------------
+# Status state (consumed by the LAN HTTP endpoint, daemon mode only)
+# ---------------------------------------------------------------------------
+# Lets a peer on the same LAN ("is it safe to power down the plane?") answer
+# without scraping the journal. Locked because the HTTP server runs in a
+# separate thread from the main sync loop.
+
+_status_lock = threading.Lock()
+_status: dict = {
+    "last_sync_epoch": None,    # epoch seconds of most recent reach-and-process cycle
+    "last_sync_files_n": 0,     # number of files downloaded in that cycle
+    "transferring": False,      # a file is in-flight via the FlashAir HTTP API right now
+    "current_file": None,       # filename being downloaded, or None
+}
+
+
+def _status_snapshot() -> dict:
+    """Return a JSON-serialisable snapshot. `epoch` is when this snapshot was taken."""
+    with _status_lock:
+        snap = dict(_status)
+    snap["epoch"] = int(time.time())
+    return snap
+
+
+def _status_set_transferring(filename: str) -> None:
+    with _status_lock:
+        _status["transferring"] = True
+        _status["current_file"] = filename
+
+
+def _status_clear_transferring() -> None:
+    with _status_lock:
+        _status["transferring"] = False
+        _status["current_file"] = None
+
+
+def _status_record_sync(files_n: int) -> None:
+    """Mark a sync session as complete: we reached the card and processed N files."""
+    with _status_lock:
+        _status["last_sync_epoch"] = int(time.time())
+        _status["last_sync_files_n"] = int(files_n)
+
+
+def _status_init_from_disk() -> None:
+    """Prime last_sync_epoch from .last_sync mtime so a daemon restart doesn't
+    erase the 'last sync at X' signal. The file count from that pre-restart
+    session isn't recoverable — left at 0 until the next sync completes."""
+    if _COOLDOWN_PATH.exists():
+        try:
+            mtime = int(_COOLDOWN_PATH.stat().st_mtime)
+            with _status_lock:
+                _status["last_sync_epoch"] = mtime
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Status HTTP server (one daemon thread, GET /status → JSON)
+# ---------------------------------------------------------------------------
+# Hangar LAN only — no auth, no TLS. Designed for one consumer (the
+# remote-switch Pi on the same LAN polling once per minute).
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path.split("?", 1)[0] != "/status":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(_status_snapshot()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args) -> None:  # noqa: A002 (signature is BaseHTTP's)
+        # Suppress per-request access logging — the consumer hits this once a
+        # minute and the noise would dominate the journal.
+        pass
+
+
+def _status_port() -> int:
+    val = os.environ.get("STATUS_HTTP_PORT", "") or _read_env().get("STATUS_HTTP_PORT", "")
+    try:
+        return int(val) if val else STATUS_HTTP_PORT_DEFAULT
+    except ValueError:
+        return STATUS_HTTP_PORT_DEFAULT
+
+
+def _start_status_server() -> Optional[ThreadingHTTPServer]:
+    """Start the LAN status server on 0.0.0.0:STATUS_HTTP_PORT. Returns the
+    server so the daemon can call .shutdown() on exit, or None on bind error."""
+    port = _status_port()
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), _StatusHandler)
+    except OSError as e:
+        log.warning(f"Status HTTP server bind failed on :{port} ({e}). Continuing without it.")
+        return None
+    t = threading.Thread(target=server.serve_forever, name="status-http", daemon=True)
+    t.start()
+    log.info(f"Status HTTP server listening on :{port}/status")
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +782,11 @@ def run(resync: bool = False, _lock=None) -> bool:
         net_id = None
         already_on_flashair = (current == cfg.flashair_ssid)
 
+        # Status: count successful FlashAir HTTP downloads this run; used by
+        # /status to answer "did all the CSVs come off the card?".
+        session_downloads = 0
+        reached_card = False
+
         # --- Phase 1: Download from FlashAir (if available) ---
         if already_on_flashair:
             log.info("Already on FlashAir (recovery from previous run).")
@@ -694,6 +809,7 @@ def run(resync: bool = False, _lock=None) -> bool:
                 if not wait_for_flashair(cfg):
                     log.error("Cannot reach FlashAir HTTP server.")
                 else:
+                    reached_card = True
                     remote_files = list_flashair_files(cfg.flashair_ip, cfg.flashair_dir)
                     log.info(f"Found {len(remote_files)} CSV(s) on FlashAir.")
 
@@ -736,14 +852,18 @@ def run(resync: bool = False, _lock=None) -> bool:
                         log.info(f"Downloading {len(new_files)} new file(s)...")
                         downloaded = []
                         for fname in new_files:
+                            _status_set_transferring(fname)
                             try:
                                 path = download_file(
                                     cfg.flashair_ip, cfg.flashair_dir,
                                     fname, cfg.local_csv_dir,
                                 )
                                 downloaded.append(path)
+                                session_downloads += 1
                             except Exception as e:
                                 log.error(f"Failed to download {fname}: {e}")
+                            finally:
+                                _status_clear_transferring()
 
                         if downloaded:
                             newest = max(Path(p).name for p in downloaded)
@@ -781,6 +901,7 @@ def run(resync: bool = False, _lock=None) -> bool:
                         if not stable:
                             log.info(f"  still growing, deferring: {fname}")
                             continue
+                        _status_set_transferring(fname)
                         try:
                             path = download_file(
                                 cfg.flashair_ip, cfg.flashair_dir,
@@ -790,10 +911,16 @@ def run(resync: bool = False, _lock=None) -> bool:
                             renamed = p.with_name(p.stem + "_rescue" + p.suffix)
                             p.rename(renamed)
                             log.info(f"  renamed {p.name} -> {renamed.name}")
+                            session_downloads += 1
                         except Exception as e:
                             log.warning(f"  lookback re-download failed for {fname}: {e}")
+                        finally:
+                            _status_clear_transferring()
             finally:
                 reconnect_home(cfg, net_id)
+                _status_clear_transferring()
+                if reached_card:
+                    _status_record_sync(session_downloads)
 
         # --- Phase 2: SCP any un-transferred local files ---
         did_work = False
@@ -840,6 +967,9 @@ def run_daemon(resync_first: bool = False) -> None:
         log.error("Another instance is already running, exiting.")
         return
 
+    _status_init_from_disk()
+    status_server = _start_status_server()
+
     poll = _poll_seconds()
     cooldown = _cooldown_minutes()
     log.info("Starting flashair-sync daemon (poll every %ds, cooldown %dm)", poll, cooldown)
@@ -867,6 +997,8 @@ def run_daemon(resync_first: bool = False) -> None:
 
         log.info("Daemon stopped.")
     finally:
+        if status_server is not None:
+            status_server.shutdown()
         release_lock(lock)
 
 
