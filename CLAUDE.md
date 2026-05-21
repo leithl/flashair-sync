@@ -19,6 +19,7 @@ Key mechanisms:
 - **Cooldown** (`.last_sync` file mtime) prevents re-scanning FlashAir for 30 min after a successful download. Only set on *complete* downloads — partial failures retry promptly.
 - **Lock file** (`.lock` with `fcntl.flock`) prevents concurrent runs. Daemon holds lock for its entire lifetime.
 - **Interruptible sleep** — daemon sleeps in 1-second increments so SIGTERM/SIGINT are handled promptly.
+- **Status file** (`--daemon` only) — atomically writes `{epoch, last_sync_epoch, last_sync_files_n, transferring, current_file}` to `/run/heater-flashair.json` (tmpfs, 0664 perms) on every state change. The hangar-controller web UI runs on the SAME Pi as a separate process (Apache mod_wsgi for `remote-switch`) and reads this file directly at page-render time — no HTTP, no localhost loopback. Module-level dict + `threading.Lock`; hooks live around the `download_file()` call sites and at the end of the "we reached the card" branch. Cron-only installs (no `--daemon`) don't write the file because there's no long-lived process to maintain it.
 
 ## Files
 

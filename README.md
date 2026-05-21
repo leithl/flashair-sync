@@ -207,6 +207,32 @@ sudo crontab -e
 | `LAST_SYNCED` | — | — | Managed by script. Last downloaded filename. |
 | `LAST_SCPD` | — | — | Managed by script. Last SCP'd filename. |
 
+## Status file
+
+When running in `--daemon` mode the script writes its current sync status to `/run/heater-flashair.json` (tmpfs) on every state change — sync session complete, transferring on, transferring off. Writes are atomic (`temp + os.replace`), 0664 perms so a non-owner consumer (e.g. Apache mod_wsgi running as `www-data` on the same host) can read it.
+
+Example contents:
+
+```json
+{
+  "epoch": 1779391430,
+  "last_sync_epoch": 1779391429,
+  "last_sync_files_n": 12,
+  "transferring": false,
+  "current_file": null
+}
+```
+
+Fields:
+
+- `epoch` — clock time when this snapshot was written.
+- `last_sync_epoch` — when the daemon most recently reached the card and processed its files (whether 0 or N were downloaded). `null` until the first such cycle; primed from `.last_sync`'s mtime on daemon restart so the signal survives across restarts.
+- `last_sync_files_n` — count of files actually downloaded in that most-recent reach-the-card cycle (0 if there was nothing new). Resets to `0` across daemon restart.
+- `transferring` — `true` while a `download_file()` call from the FlashAir HTTP API is in-flight.
+- `current_file` — filename being downloaded, else `null`.
+
+Consumers should treat the file as stale if it's missing or if `now - epoch > 120s` (the daemon writes at least at every sync cycle, and the transferring flag flips per file). The companion [remote-switch](https://github.com/leithl/remote-switch) hangar controller runs on the same Pi as a separate WSGI process and reads this file at page-render time to surface "FlashAir: N files, X ago" on its UI.
+
 ## Troubleshooting
 
 **Script never detects FlashAir:**
