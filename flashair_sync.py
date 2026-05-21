@@ -26,7 +26,6 @@ Configuration (.env file in the same directory as this script):
     WIFI_INTERFACE=wlan0                WiFi interface (default: wlan0)
     COOLDOWN_MINUTES=30                 Minutes to wait before re-checking FlashAir (default: 30)
     POLL_SECONDS=60                     Daemon poll interval in seconds (default: 60)
-    STATUS_HTTP_PORT=8765               Port for the LAN status endpoint (default: 8765, --daemon only)
 
     # Managed by the script (do not edit)
     LAST_SYNCED=                        Watermark — filename of last downloaded CSV
@@ -52,7 +51,6 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -65,7 +63,12 @@ FLASHAIR_HTTP_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 120
 COOLDOWN_MINUTES_DEFAULT = 30
 POLL_SECONDS_DEFAULT = 60
-STATUS_HTTP_PORT_DEFAULT = 8765
+
+# Status file path. /run is tmpfs on the Pi — no SD-card wear from
+# per-state-change writes, and the file naturally vanishes on reboot.
+# The hangar controller (remote-switch) WSGI app reads this directly to
+# render "FlashAir: N files, X ago" on the chart-card header.
+FLASHAIR_STATUS_FILE = Path("/run/heater-flashair.json")
 
 
 # ---------------------------------------------------------------------------
@@ -265,11 +268,14 @@ def _interruptible_sleep(seconds: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Status state (consumed by the LAN HTTP endpoint, daemon mode only)
+# Status state (written to FLASHAIR_STATUS_FILE on every change, daemon mode)
 # ---------------------------------------------------------------------------
-# Lets a peer on the same LAN ("is it safe to power down the plane?") answer
-# without scraping the journal. Locked because the HTTP server runs in a
-# separate thread from the main sync loop.
+# Lets a peer on the same host ("is it safe to power down the plane?") answer
+# without scraping the journal. The Pi running flashair-sync also runs the
+# remote-switch web UI as the Apache mod_wsgi process — both processes share
+# the filesystem, so a single tmpfs file is the cheapest "API" available.
+# Lock is kept as cheap insurance against re-entry from a future caller (only
+# one writer thread today).
 
 _status_lock = threading.Lock()
 _status: dict = {
@@ -288,16 +294,38 @@ def _status_snapshot() -> dict:
     return snap
 
 
+def _write_status() -> None:
+    """Atomically write the current status snapshot to FLASHAIR_STATUS_FILE.
+
+    Temp + rename keeps a concurrent reader (remote-switch's WSGI handler)
+    from ever seeing a half-written file. 0664 perms so www-data can read
+    it; we run as `pi` so chown isn't possible (and unnecessary — other-read
+    covers the WSGI process). Never raises — a tmpfs write failure should
+    not crash the sync loop.
+    """
+    snap = _status_snapshot()
+    try:
+        FLASHAIR_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FLASHAIR_STATUS_FILE.with_suffix(FLASHAIR_STATUS_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(snap))
+        os.chmod(str(tmp), 0o664)
+        os.replace(str(tmp), str(FLASHAIR_STATUS_FILE))
+    except OSError as e:
+        log.debug(f"Status file write failed: {e}")
+
+
 def _status_set_transferring(filename: str) -> None:
     with _status_lock:
         _status["transferring"] = True
         _status["current_file"] = filename
+    _write_status()
 
 
 def _status_clear_transferring() -> None:
     with _status_lock:
         _status["transferring"] = False
         _status["current_file"] = None
+    _write_status()
 
 
 def _status_record_sync(files_n: int) -> None:
@@ -305,6 +333,7 @@ def _status_record_sync(files_n: int) -> None:
     with _status_lock:
         _status["last_sync_epoch"] = int(time.time())
         _status["last_sync_files_n"] = int(files_n)
+    _write_status()
 
 
 def _status_init_from_disk() -> None:
@@ -318,55 +347,6 @@ def _status_init_from_disk() -> None:
                 _status["last_sync_epoch"] = mtime
         except OSError:
             pass
-
-
-# ---------------------------------------------------------------------------
-# Status HTTP server (one daemon thread, GET /status → JSON)
-# ---------------------------------------------------------------------------
-# Hangar LAN only — no auth, no TLS. Designed for one consumer (the
-# remote-switch Pi on the same LAN polling once per minute).
-
-class _StatusHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
-        if self.path.split("?", 1)[0] != "/status":
-            self.send_response(404)
-            self.end_headers()
-            return
-        body = json.dumps(_status_snapshot()).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args) -> None:  # noqa: A002 (signature is BaseHTTP's)
-        # Suppress per-request access logging — the consumer hits this once a
-        # minute and the noise would dominate the journal.
-        pass
-
-
-def _status_port() -> int:
-    val = os.environ.get("STATUS_HTTP_PORT", "") or _read_env().get("STATUS_HTTP_PORT", "")
-    try:
-        return int(val) if val else STATUS_HTTP_PORT_DEFAULT
-    except ValueError:
-        return STATUS_HTTP_PORT_DEFAULT
-
-
-def _start_status_server() -> Optional[ThreadingHTTPServer]:
-    """Start the LAN status server on 0.0.0.0:STATUS_HTTP_PORT. Returns the
-    server so the daemon can call .shutdown() on exit, or None on bind error."""
-    port = _status_port()
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", port), _StatusHandler)
-    except OSError as e:
-        log.warning(f"Status HTTP server bind failed on :{port} ({e}). Continuing without it.")
-        return None
-    t = threading.Thread(target=server.serve_forever, name="status-http", daemon=True)
-    t.start()
-    log.info(f"Status HTTP server listening on :{port}/status")
-    return server
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +948,7 @@ def run_daemon(resync_first: bool = False) -> None:
         return
 
     _status_init_from_disk()
-    status_server = _start_status_server()
+    _write_status()
 
     poll = _poll_seconds()
     cooldown = _cooldown_minutes()
@@ -997,8 +977,6 @@ def run_daemon(resync_first: bool = False) -> None:
 
         log.info("Daemon stopped.")
     finally:
-        if status_server is not None:
-            status_server.shutdown()
         release_lock(lock)
 
 

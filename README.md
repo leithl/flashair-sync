@@ -204,15 +204,14 @@ sudo crontab -e
 | `WIFI_INTERFACE` | No | `wlan0` | WiFi interface name |
 | `COOLDOWN_MINUTES` | No | `30` | Minutes to wait before re-checking FlashAir |
 | `POLL_SECONDS` | No | `60` | Daemon poll interval in seconds |
-| `STATUS_HTTP_PORT` | No | `8765` | Port the daemon serves `GET /status` on (LAN only, no auth, daemon mode only). Set to `0` to disable. |
 | `LAST_SYNCED` | — | — | Managed by script. Last downloaded filename. |
 | `LAST_SCPD` | — | — | Managed by script. Last SCP'd filename. |
 
-## Status endpoint
+## Status file
 
-When running in `--daemon` mode the script also serves `GET /status` on `0.0.0.0:8765` (override via `STATUS_HTTP_PORT`). Plain HTTP, no auth — bind it to a trusted LAN only.
+When running in `--daemon` mode the script writes its current sync status to `/run/heater-flashair.json` (tmpfs) on every state change — sync session complete, transferring on, transferring off. Writes are atomic (`temp + os.replace`), 0664 perms so a non-owner consumer (e.g. Apache mod_wsgi running as `www-data` on the same host) can read it.
 
-Example payload:
+Example contents:
 
 ```json
 {
@@ -226,13 +225,13 @@ Example payload:
 
 Fields:
 
-- `epoch` — clock time when this response was generated.
+- `epoch` — clock time when this snapshot was written.
 - `last_sync_epoch` — when the daemon most recently reached the card and processed its files (whether 0 or N were downloaded). `null` until the first such cycle; primed from `.last_sync`'s mtime on daemon restart so the signal survives across restarts.
 - `last_sync_files_n` — count of files actually downloaded in that most-recent reach-the-card cycle (0 if there was nothing new). Resets to `0` across daemon restart.
 - `transferring` — `true` while a `download_file()` call from the FlashAir HTTP API is in-flight.
 - `current_file` — filename being downloaded, else `null`.
 
-Consumers should treat the response as stale if it can't be reached or if `now - epoch > 120s`. The downstream `remote-switch` Pi reads this once per minute and surfaces it on the hangar controller's UI.
+Consumers should treat the file as stale if it's missing or if `now - epoch > 120s` (the daemon writes at least at every sync cycle, and the transferring flag flips per file). The companion [remote-switch](https://github.com/leithl/remote-switch) hangar controller runs on the same Pi as a separate WSGI process and reads this file at page-render time to surface "FlashAir: N files, X ago" on its UI.
 
 ## Troubleshooting
 
