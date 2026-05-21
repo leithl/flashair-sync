@@ -27,9 +27,16 @@ Configuration (.env file in the same directory as this script):
     COOLDOWN_MINUTES=30                 Minutes to wait before re-checking FlashAir (default: 30)
     POLL_SECONDS=60                     Daemon poll interval in seconds (default: 60)
 
+    # Optional screenshot path (BMP from card's /Screenshot/ dir).
+    # All three must be set together or all left unset.
+    FLASHAIR_SHOT_DIR=/Screenshot       Directory on the card containing BMPs
+    LOCAL_SHOT_DIR=/run/flashair-shots  Tmpfs staging dir (avoids SD-card wear)
+    REMOTE_SHOT_DIR=/path/to/shots      Destination on the remote server
+
     # Managed by the script (do not edit)
     LAST_SYNCED=                        Watermark — filename of last downloaded CSV
     LAST_SCPD=                          Watermark — filename of last SCP'd CSV
+    LAST_SHOT_SCPD=                     Watermark — filename of last SCP'd BMP
 
 Usage:
     python3 flashair_sync.py            # One-shot sync (for cron)
@@ -136,12 +143,20 @@ class Config:
     remote_dir: str
     ssh_key_path: str = ""
     wifi_interface: str = ""
+    # Screenshot path (opt-in; all three must be set together)
+    flashair_shot_dir: str = ""
+    local_shot_dir: str = ""
+    remote_shot_dir: str = ""
 
     def __post_init__(self):
         if not self.ssh_key_path:
             self.ssh_key_path = str(Path.home() / ".ssh" / "id_ed25519")
         if not self.wifi_interface:
             self.wifi_interface = "wlan0"
+
+    @property
+    def screenshots_enabled(self) -> bool:
+        return bool(self.flashair_shot_dir and self.local_shot_dir and self.remote_shot_dir)
 
 
 def load_config() -> Config:
@@ -164,6 +179,9 @@ def load_config() -> Config:
         remote_dir=_get("REMOTE_DIR"),
         ssh_key_path=_get("SSH_KEY_PATH"),
         wifi_interface=_get("WIFI_INTERFACE"),
+        flashair_shot_dir=_get("FLASHAIR_SHOT_DIR"),
+        local_shot_dir=_get("LOCAL_SHOT_DIR"),
+        remote_shot_dir=_get("REMOTE_SHOT_DIR"),
     )
 
     missing = []
@@ -178,8 +196,19 @@ def load_config() -> Config:
         log.error(f"Missing required config: {', '.join(missing)}")
         sys.exit(1)
 
+    # Screenshot fields are opt-in but must be set together
+    shot_fields = [cfg.flashair_shot_dir, cfg.local_shot_dir, cfg.remote_shot_dir]
+    if any(shot_fields) and not all(shot_fields):
+        log.error(
+            "Screenshot config requires ALL of FLASHAIR_SHOT_DIR, "
+            "LOCAL_SHOT_DIR, REMOTE_SHOT_DIR (or none).",
+        )
+        sys.exit(1)
+
     # Ensure local CSV directory exists
     Path(cfg.local_csv_dir).mkdir(parents=True, exist_ok=True)
+    if cfg.screenshots_enabled:
+        Path(cfg.local_shot_dir).mkdir(parents=True, exist_ok=True)
 
     return cfg
 
@@ -475,17 +504,12 @@ def list_flashair_files(ip: str, directory: str) -> list[str]:
     return sorted(list_flashair_files_with_sizes(ip, directory).keys())
 
 
-def list_flashair_files_with_sizes(ip: str, directory: str) -> dict[str, int]:
-    """Same as list_flashair_files, but returns {filename: size_bytes}.
+def _parse_flashair_listing(content: str) -> dict[str, int]:
+    """Parse op=100 directory listing -> {filename: size_bytes}.
 
-    The op=100 output format is:
-        DIR,FILENAME,SIZE,ATTR,DATE,TIME
-    Existing callers discarded SIZE; the stable-file check below needs it.
+    Output format per line: DIR,FILENAME,SIZE,ATTR,DATE,TIME
+    Caller filters by name.
     """
-    url = f"http://{ip}/command.cgi?op=100&DIR={directory}"
-    with urllib.request.urlopen(url, timeout=FLASHAIR_HTTP_TIMEOUT) as resp:
-        content = resp.read().decode("utf-8")
-
     out: dict[str, int] = {}
     for line in content.splitlines():
         if line.startswith("WLANSD_FILELIST"):
@@ -494,13 +518,22 @@ def list_flashair_files_with_sizes(ip: str, directory: str) -> dict[str, int]:
         if len(parts) < 3:
             continue
         fname = parts[1].strip()
-        if not (fname.startswith("log_") and fname.lower().endswith(".csv")):
-            continue
         try:
             out[fname] = int(parts[2].strip())
         except ValueError:
             continue
     return out
+
+
+def list_flashair_files_with_sizes(ip: str, directory: str) -> dict[str, int]:
+    """List CSV files on FlashAir matching the engine-monitor pattern."""
+    url = f"http://{ip}/command.cgi?op=100&DIR={directory}"
+    with urllib.request.urlopen(url, timeout=FLASHAIR_HTTP_TIMEOUT) as resp:
+        content = resp.read().decode("utf-8")
+    return {
+        f: sz for f, sz in _parse_flashair_listing(content).items()
+        if f.startswith("log_") and f.lower().endswith(".csv")
+    }
 
 
 # How long to wait between size polls to confirm a file has stopped growing.
@@ -630,6 +663,137 @@ def download_file(ip: str, directory: str, filename: str, local_dir: str) -> str
     size_kb = local_path.stat().st_size / 1024
     log.info(f"  Saved {filename} ({size_kb:.0f} KB)")
     return str(local_path)
+
+
+# ---------------------------------------------------------------------------
+# Screenshot path (BMPs from FLASHAIR_SHOT_DIR, staged in tmpfs LOCAL_SHOT_DIR)
+# ---------------------------------------------------------------------------
+# Differences from the CSV path:
+#  - LOCAL_SHOT_DIR is typically /run/flashair-shots (tmpfs) — avoids SD-card
+#    wear, since BMPs are 2.81 MB each vs CSVs at <500 KB
+#  - Single watermark (LAST_SHOT_SCPD). The downstream host keeps originals,
+#    so the Pi doesn't need a "10 most recent" safety buffer.
+#  - No stability check / lookback: screenshots are single-frame writes,
+#    not streamed like the active flight CSV
+#  - BMP is deleted from /run as soon as SCP confirms delivery
+
+def list_flashair_screenshots(ip: str, directory: str) -> list[str]:
+    """List BMP screenshot files on the FlashAir."""
+    url = f"http://{ip}/command.cgi?op=100&DIR={directory}"
+    with urllib.request.urlopen(url, timeout=FLASHAIR_HTTP_TIMEOUT) as resp:
+        content = resp.read().decode("utf-8")
+    return sorted(
+        f for f in _parse_flashair_listing(content)
+        if f.lower().endswith(".bmp")
+    )
+
+
+def load_last_shot_scpd() -> str:
+    return _read_env().get("LAST_SHOT_SCPD", "")
+
+
+def save_last_shot_scpd(filename: str) -> None:
+    env = _read_env()
+    env["LAST_SHOT_SCPD"] = filename
+    _write_env(env)
+    log.info(f"Updated LAST_SHOT_SCPD={filename}")
+
+
+def pending_scp_shots(local_dir: str) -> list[Path]:
+    """All BMPs currently staged in local_dir. /run wipes on reboot, so
+    presence in this dir means 'downloaded but not yet SCP-confirmed'."""
+    p = Path(local_dir)
+    if not p.is_dir():
+        return []
+    return sorted(p.glob("*.bmp"))
+
+
+def download_screenshots(cfg: Config, resync: bool = False) -> int:
+    """Phase-1 BMP download: pull new BMPs from FlashAir into LOCAL_SHOT_DIR.
+
+    Returns the number of files successfully downloaded.
+    """
+    Path(cfg.local_shot_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        remote_files = list_flashair_screenshots(cfg.flashair_ip, cfg.flashair_shot_dir)
+    except Exception as e:
+        log.error(f"Screenshot listing failed: {e}")
+        return 0
+    log.info(f"Found {len(remote_files)} BMP(s) on FlashAir.")
+
+    watermark = "" if resync else load_last_shot_scpd()
+    new_files, skipped = collect_new_files(remote_files, watermark)
+    if skipped:
+        log.info(f"Screenshot: skipped {len(skipped)} already-synced.")
+
+    # Carry-over from previous cycle's failed SCP: don't re-download
+    already_local = {p.name for p in pending_scp_shots(cfg.local_shot_dir)}
+    to_download = [f for f in new_files if f not in already_local]
+    carryover = len(new_files) - len(to_download)
+    if carryover:
+        log.info(f"Screenshot: {carryover} already in {cfg.local_shot_dir}, skipping re-download.")
+
+    if not to_download:
+        return 0
+
+    log.info(f"Screenshot: downloading {len(to_download)} new BMP(s)...")
+    downloaded = 0
+    for fname in to_download:
+        _status_set_transferring(fname)
+        try:
+            download_file(
+                cfg.flashair_ip, cfg.flashair_shot_dir,
+                fname, cfg.local_shot_dir,
+            )
+            downloaded += 1
+        except Exception as e:
+            log.error(f"Failed to download screenshot {fname}: {e}")
+        finally:
+            _status_clear_transferring()
+    return downloaded
+
+
+def scp_screenshots(cfg: Config, local_paths: list[Path]) -> int:
+    """SCP staged BMPs to REMOTE_SHOT_DIR. On each success, advance
+    LAST_SHOT_SCPD and delete the local file.
+
+    BMPs are ~2.81 MB each — bigger SCP timeout than the CSV path because
+    the link to the downstream host is residential internet, not LAN.
+    """
+    transferred = 0
+    last_ok = ""
+    for path in local_paths:
+        fname = path.name
+        dest = f"{cfg.remote_user}@{cfg.remote_host}:{cfg.remote_shot_dir}/{fname}"
+        cmd = [
+            "scp",
+            "-i", cfg.ssh_key_path,
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            str(path), dest,
+        ]
+        log.info(f"SCP {fname} → {cfg.remote_host}:{cfg.remote_shot_dir}/")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            log.error(f"SCP timed out for {fname}")
+            break
+        if result.returncode == 0:
+            transferred += 1
+            last_ok = fname
+            try:
+                path.unlink()
+            except OSError as e:
+                log.warning(f"Could not delete staged {path}: {e}")
+        else:
+            log.error(f"SCP failed for {fname}: {result.stderr.strip()}")
+            break
+
+    if last_ok:
+        save_last_shot_scpd(last_ok)
+
+    log.info(f"Screenshot: transferred {transferred}/{len(local_paths)}.")
+    return transferred
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +1060,16 @@ def run(resync: bool = False, _lock=None) -> bool:
                             log.warning(f"  lookback re-download failed for {fname}: {e}")
                         finally:
                             _status_clear_transferring()
+
+                    # --- Phase 1b: Screenshot download (opt-in) ---
+                    # Runs while still on FlashAir, after the CSV path.
+                    # Wrapped so a screenshot failure doesn't tank the CSV sync.
+                    if cfg.screenshots_enabled:
+                        try:
+                            shot_n = download_screenshots(cfg, resync=resync)
+                            session_downloads += shot_n
+                        except Exception as e:
+                            log.error(f"Screenshot download phase failed: {e}")
             finally:
                 reconnect_home(cfg, net_id)
                 _status_clear_transferring()
@@ -915,20 +1089,36 @@ def run(resync: bool = False, _lock=None) -> bool:
         else:
             log.debug("No files pending SCP.")
 
+        # --- Phase 2b: SCP pending screenshots (opt-in) ---
+        shots_ok = True
+        shots_transferred = 0
+        pending_shots: list[Path] = []
+        if cfg.screenshots_enabled:
+            pending_shots = pending_scp_shots(cfg.local_shot_dir)
+            if pending_shots:
+                did_work = True
+                log.info(f"{len(pending_shots)} BMP(s) pending SCP.")
+                shots_transferred = scp_screenshots(cfg, pending_shots)
+                shots_ok = (shots_transferred == len(pending_shots))
+
         # --- Phase 3: Cleanup old local files ---
         wm = load_last_synced()
         if wm:
             cleanup_local(cfg.local_csv_dir, wm)
 
-        if not scp_ok:
-            log.warning("Sync complete (SCP incomplete, %d/%d transferred).",
-                        transferred, len(to_scp))
+        all_ok = scp_ok and shots_ok
+        if not all_ok:
+            log.warning(
+                "Sync complete (incomplete — CSV %d/%d, BMP %d/%d).",
+                transferred, len(to_scp),
+                shots_transferred, len(pending_shots),
+            )
         elif did_work or (already_on_flashair or net_id is not None):
             log.info("Sync complete.")
         else:
             log.debug("Sync complete (no-op).")
 
-        return not scp_ok
+        return not all_ok
 
     finally:
         if own_lock:

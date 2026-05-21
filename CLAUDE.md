@@ -4,18 +4,20 @@
 
 Syncs engine monitor CSV files from a Toshiba FlashAir WiFi SD card to a remote server, running on a Raspberry Pi. Detects the card's WiFi, connects, downloads new CSVs via the FlashAir HTTP API, reconnects to home WiFi, and SCPs files to a remote server — all unattended.
 
+Optionally also syncs BMP screenshots from the card's `/Screenshot/` directory (configured via `FLASHAIR_SHOT_DIR` / `LOCAL_SHOT_DIR` / `REMOTE_SHOT_DIR`). Screenshots are staged in tmpfs and SCPed to a separate destination dir for a downstream consumer to handle (convert + upload to a photo service / archive). If the screenshot env vars are unset, this path is skipped entirely.
+
 Downstream, [savvy-uploader](https://github.com/leithl/savvy-uploader) watches the SCP destination directory and uploads CSVs to SavvyAviation.com. The two projects share a file naming contract (`log_YYYYMMDD_HHMMSS_KXXX.csv`) and watermark pattern.
 
 ## Architecture
 
 Three-phase sync cycle, run either as a systemd daemon (recommended) or via cron:
 
-1. **Download** — Connect to FlashAir WiFi, list/download new CSVs via HTTP API
-2. **Transfer** — SCP files to remote server (destination must match savvy-uploader's `CSV_DIR`)
-3. **Cleanup** — Delete old local CSVs, keeping 10 most recent
+1. **Download** — Connect to FlashAir WiFi, list/download new CSVs via HTTP API. If screenshots are configured, also list/download new `*.bmp` from `FLASHAIR_SHOT_DIR` into `LOCAL_SHOT_DIR` (typically `/run/flashair-shots` — tmpfs).
+2. **Transfer** — SCP CSVs to the CSV destination, then SCP staged BMPs to `REMOTE_SHOT_DIR`. Each successful BMP SCP advances `LAST_SHOT_SCPD` and immediately deletes the staged copy (the downstream host keeps originals).
+3. **Cleanup** — Delete already-synced local CSVs, keeping the 10 most recent. (BMPs are cleaned up inline in step 2.)
 
 Key mechanisms:
-- **Watermarks** (`LAST_SYNCED`, `LAST_SCPD`) in `.env` track progress across restarts. Files sort lexicographically by name = chronologically.
+- **Watermarks** (`LAST_SYNCED`, `LAST_SCPD` for CSVs; `LAST_SHOT_SCPD` for BMPs) in `.env` track progress across restarts. Files sort lexicographically by name = chronologically.
 - **Cooldown** (`.last_sync` file mtime) prevents re-scanning FlashAir for 30 min after a successful download. Only set on *complete* downloads — partial failures retry promptly.
 - **Lock file** (`.lock` with `fcntl.flock`) prevents concurrent runs. Daemon holds lock for its entire lifetime.
 - **Interruptible sleep** — daemon sleeps in 1-second increments so SIGTERM/SIGINT are handled promptly.
@@ -38,7 +40,8 @@ flashair-sync.service     systemd unit file
 - **WiFi management** — Linux uses `wpa_cli`; macOS variant uses `networksetup`. These are the only platform-specific parts.
 - **macOS variant** — `flashair_sync_macos.py` is for local testing, not deployed. Keep it in sync with the main script when making changes. It is NOT tracked in git.
 - **Config pattern** — env vars override `.env` file values. Required fields validated at startup.
-- **.env is both config and state** — watermarks (`LAST_SYNCED`, `LAST_SCPD`) are written back to `.env` by the script. The `_write_env()` helper preserves comments and ordering.
+- **.env is both config and state** — watermarks (`LAST_SYNCED`, `LAST_SCPD`, `LAST_SHOT_SCPD`) are written back to `.env` by the script. The `_write_env()` helper preserves comments and ordering.
+- **Screenshot path** — Different shape from CSV: **single** watermark (`LAST_SHOT_SCPD`) advanced only on SCP success, no separate `_SYNCED` (the staging dir is tmpfs and wipes on reboot, so there's no value in tracking "downloaded but not transferred" across restarts). No stability check / lookback rescue — screenshots are single-frame writes, not streamed like the active flight CSV. The downstream host keeps the BMP, so the Pi doesn't need an N-most-recent safety buffer.
 - **Error recovery** — `try/finally` ensures WiFi reconnects after FlashAir operations. SCP failures trigger prompt retry (poll interval) instead of waiting for cooldown. SCP timeouts preserve the watermark for already-transferred files.
 
 ## Integration with savvy-uploader
@@ -56,8 +59,9 @@ The SCP destination in this project's `.env` (`REMOTE_DIR`) must be the same pat
 
 - **Re-download everything**: `python3 flashair_sync.py --resync`
 - **Debug a cycle**: `python3 flashair_sync.py -v` (one-shot verbose mode)
-- **Reset watermarks**: edit `LAST_SYNCED=` and `LAST_SCPD=` in `.env`
+- **Reset watermarks**: edit `LAST_SYNCED=`, `LAST_SCPD=`, `LAST_SHOT_SCPD=` in `.env`
 - **Change poll/cooldown**: edit `POLL_SECONDS` / `COOLDOWN_MINUTES` in `.env`, restart daemon
+- **Enable screenshots**: set `FLASHAIR_SHOT_DIR=/Screenshot`, `LOCAL_SHOT_DIR=/run/flashair-shots`, `REMOTE_SHOT_DIR=<path>` (all three or none), restart daemon
 
 ## Public repo — keep contributions standalone
 

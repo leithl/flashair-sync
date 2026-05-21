@@ -8,6 +8,8 @@ Can run as a **systemd service** (recommended) or via **cron**.
 
 Designed to feed into [savvy-upload](https://github.com/leithl/savvy-uploader), which then uploads the CSVs to SavvyAviation.com.
 
+Optionally also syncs BMP screenshots from the card's `/Screenshot/` directory (configured via `FLASHAIR_SHOT_DIR` / `LOCAL_SHOT_DIR` / `REMOTE_SHOT_DIR`). BMPs are staged in tmpfs to avoid SD-card wear, then SCPed to a separate destination for a downstream consumer to pick up. See [Optional: screenshot sync](#optional-screenshot-sync) below.
+
 ## How It Works
 
 1. **Poll** — The script runs periodically (as a systemd service or via cron). It triggers a WiFi scan via `wpa_cli`.
@@ -204,8 +206,25 @@ sudo crontab -e
 | `WIFI_INTERFACE` | No | `wlan0` | WiFi interface name |
 | `COOLDOWN_MINUTES` | No | `30` | Minutes to wait before re-checking FlashAir |
 | `POLL_SECONDS` | No | `60` | Daemon poll interval in seconds |
-| `LAST_SYNCED` | — | — | Managed by script. Last downloaded filename. |
-| `LAST_SCPD` | — | — | Managed by script. Last SCP'd filename. |
+| `FLASHAIR_SHOT_DIR` | No | — | Card dir holding BMP screenshots (e.g. `/Screenshot`). Required if any screenshot var is set. |
+| `LOCAL_SHOT_DIR` | No | — | Tmpfs staging dir on the Pi (e.g. `/run/flashair-shots`). Required if any screenshot var is set. |
+| `REMOTE_SHOT_DIR` | No | — | Destination dir on the remote server for BMPs. Required if any screenshot var is set. |
+| `LAST_SYNCED` | — | — | Managed by script. Last downloaded CSV filename. |
+| `LAST_SCPD` | — | — | Managed by script. Last SCP'd CSV filename. |
+| `LAST_SHOT_SCPD` | — | — | Managed by script. Last SCP'd BMP filename. |
+
+## Optional: screenshot sync
+
+If you enable the three `*_SHOT_DIR` env vars together, each sync cycle also pulls any new `*.bmp` from `FLASHAIR_SHOT_DIR` on the card and SCPs them to `REMOTE_SHOT_DIR` on the remote server. The local staging happens in `LOCAL_SHOT_DIR` — point this at tmpfs (e.g. `/run/flashair-shots`) because the BMPs are ~2.81 MB each and you don't want to wear the SD card.
+
+Differences from the CSV path:
+
+- **Single watermark** (`LAST_SHOT_SCPD`), advanced only when SCP confirms delivery. The local staging dir is wiped on reboot, so there's no separate "downloaded but not yet transferred" watermark — the staged file IS the in-flight state.
+- **No stability check / lookback rescue** — screenshots are single-frame writes, not streamed like the active flight CSV.
+- **Delete after SCP** — the BMP is removed from `LOCAL_SHOT_DIR` immediately after a successful transfer. The downstream host is the safety buffer.
+- **Bigger SCP timeout** (120s vs 60s) to allow for the larger files over a possibly-slow WAN link.
+
+If none of the `*_SHOT_DIR` vars are set, this path is inert — existing CSV-only setups see no behaviour change.
 
 ## Status file
 
