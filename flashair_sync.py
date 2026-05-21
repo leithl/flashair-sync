@@ -17,8 +17,8 @@ Configuration (.env file in the same directory as this script):
     HOME_PASSWORD=secret                Home WiFi password (omit for open networks)
     LOCAL_CSV_DIR=/home/pi/csvs         Local directory to store downloaded CSVs
     REMOTE_HOST=192.168.1.100           Remote server hostname or IP for SCP
-    REMOTE_USER=leith                   SSH user on the remote server
-    REMOTE_DIR=/home/leith/savvy/csvs   Destination directory on the remote server
+    REMOTE_USER=youruser                SSH user on the remote server
+    REMOTE_DIR=/path/to/csvs            Destination directory on the remote server
 
     # Optional
     FLASHAIR_IP=192.168.0.1             FlashAir IP (default: 192.168.0.1)

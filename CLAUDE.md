@@ -42,15 +42,14 @@ flashair-sync.service     systemd unit file
 
 ## Integration with savvy-uploader
 
-The SCP destination in this project's `.env` (`REMOTE_DIR`) must be the same path as savvy-uploader's `CSV_DIR`. savvy-uploader uses `inotifywait` with a 60-second debounce to batch files before uploading. Both projects use the same watermark-based skip pattern and keep-10-recent cleanup policy.
+The SCP destination in this project's `.env` (`REMOTE_DIR`) must be the same path as savvy-uploader's `CSV_DIR`. savvy-uploader uses `inotifywait` with a 60-second debounce to batch files before uploading. Both projects use the same filename-based watermark pattern (lex sort on `log_YYYYMMDD_HHMMSS_KXXX.csv` = chronological).
 
 ## Development workflow
 
 - Test locally with `flashair_sync_macos.py` on macOS, then sync changes to `flashair_sync.py`
 - Deploy to Pi: `git pull` on the Pi, then `sudo systemctl restart flashair-sync`
 - View daemon logs: `journalctl -u flashair-sync -f`
-- The Pi runs Raspberry Pi OS with `wpa_supplicant`; the user is `pi`
-- Editor preference: `vi`
+- The Pi runs Raspberry Pi OS with `wpa_supplicant`; default user is `pi`
 
 ## Common tasks
 
@@ -58,3 +57,12 @@ The SCP destination in this project's `.env` (`REMOTE_DIR`) must be the same pat
 - **Debug a cycle**: `python3 flashair_sync.py -v` (one-shot verbose mode)
 - **Reset watermarks**: edit `LAST_SYNCED=` and `LAST_SCPD=` in `.env`
 - **Change poll/cooldown**: edit `POLL_SECONDS` / `COOLDOWN_MINUTES` in `.env`, restart daemon
+
+## Public repo — keep contributions standalone
+
+This repo is public on GitHub. PRs, commit messages, code comments, log strings, and docs must be readable to someone with no context beyond this repo:
+
+- **No references to private downstream consumers**, regardless of who owns them. If a change is motivated by a downstream project, frame it in standalone terms ("files arrive at `REMOTE_DIR` for a downstream consumer to pick up") without naming or linking the downstream.
+- **No PII or operational context**: no real hostnames, no real usernames in paths, no SSH aliases, no real watermark values, no real aircraft IDs. The conventional Raspberry Pi default user `pi` is fine in setup examples. Use generic placeholders for anything else (`/path/to/csvs`, `user@host:`, `myhost.example.com`).
+- **PR test plans must be reproducible cold** by someone setting up this repo fresh — not "deploy to my Pi". Generic commands only.
+- **Public ↔ public cross-references are fine.** [savvy-uploader](https://github.com/leithl/savvy-uploader) and [remote-switch](https://github.com/leithl/remote-switch) are also public and are named here as part of the documented pipeline / co-tenant context. The rule is one-way: PUBLIC repos must not reference PRIVATE repos.
