@@ -337,6 +337,13 @@ _status: dict = {
     "last_shot_sync_epoch": None,
     "last_shot_sync_files_n": 0,
 
+    # WiFi SSID the daemon is currently associated to. Empty string from
+    # wpa_cli (no association) is normalised to None. The remote-switch OLED
+    # uses this to surface "on FlashAir-Card" (amber) vs "on Hangar-WiFi"
+    # (grey) vs "no wifi" (red), letting the user see at a glance whether
+    # the radio actually hopped to the expected network.
+    "current_ssid": None,
+
     # Back-compat with the v0 contract — older consumers (pre-stage) read these.
     # `transferring=True` whenever stage is any of the four active transfer stages.
     "transferring": False,
@@ -424,6 +431,15 @@ def _status_set_session_counts(*, csv_n: int = 0, shots_n: int = 0) -> None:
     with _status_lock:
         _status["session_csv_n"] = int(csv_n)
         _status["session_shots_n"] = int(shots_n)
+    _write_status()
+
+
+def _status_set_ssid(ssid: str) -> None:
+    """Update current_ssid. Empty string (wpa_cli's "not associated" response)
+    is normalised to None so consumers can distinguish "wifi up but on no
+    network" from "we just haven't checked yet"."""
+    with _status_lock:
+        _status["current_ssid"] = ssid if ssid else None
     _write_status()
 
 
@@ -1004,6 +1020,7 @@ def run(resync: bool = False, _lock=None) -> bool:
 
         iface = cfg.wifi_interface
         current = get_current_ssid(iface)
+        _status_set_ssid(current)
         net_id = None
         already_on_flashair = (current == cfg.flashair_ssid)
 
@@ -1021,12 +1038,14 @@ def run(resync: bool = False, _lock=None) -> bool:
         elif not current:
             log.warning("WiFi disconnected. Attempting to reconnect home...")
             reconnect_home(cfg)
+            _status_set_ssid(get_current_ssid(iface))
             # Fall through to Phase 2 (SCP retry)
         else:
             # On home WiFi — scan for FlashAir
             if scan_for_ssid(iface, cfg.flashair_ssid):
                 net_id = connect_to_flashair(cfg)
                 already_on_flashair = True
+                _status_set_ssid(get_current_ssid(iface))
             else:
                 log.debug(f"FlashAir '{cfg.flashair_ssid}' not in range.")
 
@@ -1195,6 +1214,7 @@ def run(resync: bool = False, _lock=None) -> bool:
                             log.error(f"Screenshot download phase failed: {e}")
             finally:
                 reconnect_home(cfg, net_id)
+                _status_set_ssid(get_current_ssid(iface))
                 _status_clear_transferring()
                 if reached_card:
                     _status_record_sync(session_downloads)

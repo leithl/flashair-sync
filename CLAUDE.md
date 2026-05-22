@@ -36,6 +36,7 @@ Key mechanisms:
       "last_sync_files_n": <int>,
       "last_shot_sync_epoch": <int|null>,
       "last_shot_sync_files_n": <int>,
+      "current_ssid": <str|null>,   // current wpa_cli SSID; null = not associated
       "transferring": <bool>,       // back-compat with v0 consumers
       "current_file": <str|null>    // back-compat
     }

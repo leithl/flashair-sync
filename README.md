@@ -244,6 +244,7 @@ Example contents (mid-cycle, downloading the 3rd of 7 CSVs while 5 BMPs wait the
   "last_sync_files_n": 12,
   "last_shot_sync_epoch": 1779302195,
   "last_shot_sync_files_n": 4,
+  "current_ssid": "FlashAir-Card",
   "transferring": true,
   "current_file": "log_YYYYMMDD_HHMMSS_KXXX.csv"
 }
@@ -259,6 +260,7 @@ Fields:
 - `last_sync_epoch` — when the daemon most recently reached the card and processed its CSVs. `null` until the first such cycle; primed from `.last_sync`'s mtime on daemon restart.
 - `last_sync_files_n` — count of CSVs actually downloaded in that most-recent reach-the-card cycle. Resets to `0` across daemon restart.
 - `last_shot_sync_epoch` / `last_shot_sync_files_n` — parallel of the above for the BMP pipeline. `null` / `0` until the first shot cycle since daemon restart.
+- `current_ssid` — WiFi network the daemon is currently associated to (`wpa_cli status` query). `null` when not associated. Updated at cycle start, after a FlashAir association, and after each `reconnect_home()` call — so a consumer can see the radio physically hopping from hangar SSID to FlashAir SSID and back as proof the wifi side is healthy.
 - `transferring` — `true` while a `download_file()` or SCP is in-flight. Retained for back-compat with v0 consumers (use `stage != "idle"` for the same signal in the new contract).
 - `current_file` — filename being transferred, else `null`.
 
