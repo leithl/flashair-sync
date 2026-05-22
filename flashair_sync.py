@@ -75,7 +75,10 @@ POLL_SECONDS_DEFAULT = 60
 # per-state-change writes, and the file naturally vanishes on reboot.
 # The hangar controller (remote-switch) WSGI app reads this directly to
 # render "FlashAir: N files, X ago" on the chart-card header.
-FLASHAIR_STATUS_FILE = Path("/run/heater-flashair.json")
+# Status file lives inside the service's RuntimeDirectory (/run/flashair-shots/)
+# so the daemon (User=leith) can write to it. /run/ itself is root:root 0755
+# — a non-root daemon can't create files there.
+FLASHAIR_STATUS_FILE = Path("/run/flashair-shots/heater-flashair.json")
 
 
 # ---------------------------------------------------------------------------
