@@ -5,6 +5,10 @@ After=network.target
 [Service]
 Type=simple
 User=pi
+# Pre-create /run/flashair-shots/ owned by the service user so the
+# optional screenshot path can stage BMPs there. Harmless if screenshots
+# aren't configured (an empty tmpfs dir).
+RuntimeDirectory=flashair-shots
 WorkingDirectory=%h/flashair-sync
 ExecStart=%h/flashair-sync/venv/bin/python %h/flashair-sync/flashair_sync.py --daemon
 Restart=on-failure
