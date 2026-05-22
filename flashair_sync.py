@@ -308,10 +308,36 @@ def _interruptible_sleep(seconds: float) -> None:
 
 _status_lock = threading.Lock()
 _status: dict = {
+    # Pipeline stage (added 2026-05-21). Lets a glance-only consumer surface
+    # *what* is happening, not just whether something is. Linear progression:
+    #   idle → scanning → downloading_logs → downloading_shots
+    #        → uploading_logs → uploading_shots → idle
+    # Stages may be skipped when their phase has no new work.
+    "stage": "idle",
+
+    # Per-stage progress — current stage's "X of Y files".
+    "files_done": 0,
+    "files_total": 0,
+
+    # Session counts — set once per cycle from the FlashAir directory listings.
+    # Lets the consumer show "N shots queued" during the logs phase and
+    # "N logs done" during the shots phase without re-enumerating itself.
+    "session_csv_n": 0,
+    "session_shots_n": 0,
+
+    # CSV watermark info
     "last_sync_epoch": None,    # epoch seconds of most recent reach-and-process cycle
     "last_sync_files_n": 0,     # number of files downloaded in that cycle
-    "transferring": False,      # a file is in-flight via the FlashAir HTTP API right now
-    "current_file": None,       # filename being downloaded, or None
+
+    # Screenshot watermark info — parallels last_sync_* for the BMP pipeline.
+    # None until at least one screenshot cycle has completed since daemon start.
+    "last_shot_sync_epoch": None,
+    "last_shot_sync_files_n": 0,
+
+    # Back-compat with the v0 contract — older consumers (pre-stage) read these.
+    # `transferring=True` whenever stage is any of the four active transfer stages.
+    "transferring": False,
+    "current_file": None,
 }
 
 
@@ -358,10 +384,43 @@ def _status_clear_transferring() -> None:
 
 
 def _status_record_sync(files_n: int) -> None:
-    """Mark a sync session as complete: we reached the card and processed N files."""
+    """Mark a CSV sync session as complete: we reached the card and processed N files."""
     with _status_lock:
         _status["last_sync_epoch"] = int(time.time())
         _status["last_sync_files_n"] = int(files_n)
+    _write_status()
+
+
+def _status_record_shot_sync(files_n: int) -> None:
+    """Mark a screenshot sync session as complete. Parallels _status_record_sync."""
+    with _status_lock:
+        _status["last_shot_sync_epoch"] = int(time.time())
+        _status["last_shot_sync_files_n"] = int(files_n)
+    _write_status()
+
+
+def _status_set_stage(stage: str, *, files_total: int = 0) -> None:
+    """Transition to a new pipeline stage. Resets per-stage progress to 0 of files_total."""
+    with _status_lock:
+        _status["stage"] = stage
+        _status["files_done"] = 0
+        _status["files_total"] = int(files_total)
+    _write_status()
+
+
+def _status_inc_files_done() -> None:
+    """Increment files_done by one (call after a successful per-file transfer)."""
+    with _status_lock:
+        _status["files_done"] += 1
+    _write_status()
+
+
+def _status_set_session_counts(*, csv_n: int = 0, shots_n: int = 0) -> None:
+    """Set the once-per-cycle session totals. Called after enumerating both
+    directories on the FlashAir, before any downloads begin."""
+    with _status_lock:
+        _status["session_csv_n"] = int(csv_n)
+        _status["session_shots_n"] = int(shots_n)
     _write_status()
 
 
@@ -708,30 +767,33 @@ def pending_scp_shots(local_dir: str) -> list[Path]:
     return sorted(p.glob("*.bmp"))
 
 
-def download_screenshots(cfg: Config, resync: bool = False) -> int:
-    """Phase-1 BMP download: pull new BMPs from FlashAir into LOCAL_SHOT_DIR.
+def download_screenshots(
+    cfg: Config, new_files: list[str], resync: bool = False,
+) -> int:
+    """Phase-1b BMP download: pull new BMPs from FlashAir into LOCAL_SHOT_DIR.
+
+    `new_files` is a pre-enumerated list (post-watermark) from the caller's
+    earlier `list_flashair_screenshots()` call — passed in so the dashboard's
+    session totals are set before any download begins, and so this function
+    doesn't repeat the listing HTTP call.
+
+    `resync` is accepted for symmetry with the CSV path but currently has
+    no effect (carry-over filtering still uses the local staging dir).
 
     Returns the number of files successfully downloaded.
     """
+    del resync  # reserved for symmetry; no resync-specific behavior here
     Path(cfg.local_shot_dir).mkdir(parents=True, exist_ok=True)
-    try:
-        remote_files = list_flashair_screenshots(cfg.flashair_ip, cfg.flashair_shot_dir)
-    except Exception as e:
-        log.error(f"Screenshot listing failed: {e}")
-        return 0
-    log.info(f"Found {len(remote_files)} BMP(s) on FlashAir.")
-
-    watermark = "" if resync else load_last_shot_scpd()
-    new_files, skipped = collect_new_files(remote_files, watermark)
-    if skipped:
-        log.info(f"Screenshot: skipped {len(skipped)} already-synced.")
 
     # Carry-over from previous cycle's failed SCP: don't re-download
     already_local = {p.name for p in pending_scp_shots(cfg.local_shot_dir)}
     to_download = [f for f in new_files if f not in already_local]
     carryover = len(new_files) - len(to_download)
     if carryover:
-        log.info(f"Screenshot: {carryover} already in {cfg.local_shot_dir}, skipping re-download.")
+        log.info(
+            f"Screenshot: {carryover} already in {cfg.local_shot_dir}, "
+            f"skipping re-download."
+        )
 
     if not to_download:
         return 0
@@ -746,6 +808,7 @@ def download_screenshots(cfg: Config, resync: bool = False) -> int:
                 fname, cfg.local_shot_dir,
             )
             downloaded += 1
+            _status_inc_files_done()
         except Exception as e:
             log.error(f"Failed to download screenshot {fname}: {e}")
         finally:
@@ -773,21 +836,26 @@ def scp_screenshots(cfg: Config, local_paths: list[Path]) -> int:
             str(path), dest,
         ]
         log.info(f"SCP {fname} → {cfg.remote_host}:{cfg.remote_shot_dir}/")
+        _status_set_transferring(fname)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        except subprocess.TimeoutExpired:
-            log.error(f"SCP timed out for {fname}")
-            break
-        if result.returncode == 0:
-            transferred += 1
-            last_ok = fname
             try:
-                path.unlink()
-            except OSError as e:
-                log.warning(f"Could not delete staged {path}: {e}")
-        else:
-            log.error(f"SCP failed for {fname}: {result.stderr.strip()}")
-            break
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                log.error(f"SCP timed out for {fname}")
+                break
+            if result.returncode == 0:
+                transferred += 1
+                last_ok = fname
+                _status_inc_files_done()
+                try:
+                    path.unlink()
+                except OSError as e:
+                    log.warning(f"Could not delete staged {path}: {e}")
+            else:
+                log.error(f"SCP failed for {fname}: {result.stderr.strip()}")
+                break
+        finally:
+            _status_clear_transferring()
 
     if last_ok:
         save_last_shot_scpd(last_ok)
@@ -883,17 +951,22 @@ def scp_files(cfg: Config, local_paths: list[str]) -> int:
             path, dest,
         ]
         log.info(f"SCP {fname} → {cfg.remote_host}:{cfg.remote_dir}/")
+        _status_set_transferring(fname)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        except subprocess.TimeoutExpired:
-            log.error(f"SCP timed out for {fname}")
-            break
-        if result.returncode == 0:
-            transferred += 1
-            last_ok = fname
-        else:
-            log.error(f"SCP failed for {fname}: {result.stderr.strip()}")
-            break  # Stop on first failure (network likely down)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                log.error(f"SCP timed out for {fname}")
+                break
+            if result.returncode == 0:
+                transferred += 1
+                last_ok = fname
+                _status_inc_files_done()
+            else:
+                log.error(f"SCP failed for {fname}: {result.stderr.strip()}")
+                break  # Stop on first failure (network likely down)
+        finally:
+            _status_clear_transferring()
 
     if last_ok:
         save_last_scpd(last_ok)
@@ -921,6 +994,11 @@ def run(resync: bool = False, _lock=None) -> bool:
         lock = _lock
 
     try:
+        # Fresh cycle — reset stage + session counters so a stale dashboard
+        # doesn't carry over "5 shots queued" from a previous run.
+        _status_set_stage("scanning")
+        _status_set_session_counts(csv_n=0, shots_n=0)
+
         iface = cfg.wifi_interface
         current = get_current_ssid(iface)
         net_id = None
@@ -929,6 +1007,7 @@ def run(resync: bool = False, _lock=None) -> bool:
         # Status: count successful FlashAir HTTP downloads this run; used by
         # /status to answer "did all the CSVs come off the card?".
         session_downloads = 0
+        session_shot_downloads = 0
         reached_card = False
 
         # --- Phase 1: Download from FlashAir (if available) ---
@@ -989,10 +1068,42 @@ def run(resync: bool = False, _lock=None) -> bool:
                             )
                             new_files = new_files[:-1]  # all but the unstable one
 
+                    # Pre-enumerate screenshots so the dashboard can show
+                    # "N shots queued" alongside CSV progress. Done before
+                    # the CSV download loop so the consumer sees both totals
+                    # from the start of the cycle.
+                    new_shots: list[str] = []
+                    if cfg.screenshots_enabled:
+                        try:
+                            remote_shots = list_flashair_screenshots(
+                                cfg.flashair_ip, cfg.flashair_shot_dir,
+                            )
+                            shot_watermark = "" if resync else load_last_shot_scpd()
+                            new_shots, _shot_skipped = collect_new_files(
+                                remote_shots, shot_watermark,
+                            )
+                            if _shot_skipped:
+                                log.info(
+                                    f"Screenshot: skipped "
+                                    f"{len(_shot_skipped)} already-synced."
+                                )
+                        except Exception as e:
+                            log.warning(
+                                f"Screenshot listing failed "
+                                f"(will retry next cycle): {e}"
+                            )
+
+                    _status_set_session_counts(
+                        csv_n=len(new_files), shots_n=len(new_shots),
+                    )
+
                     if not new_files:
                         log.info("No new files to download.")
                         _touch_cooldown()
                     else:
+                        _status_set_stage(
+                            "downloading_logs", files_total=len(new_files),
+                        )
                         log.info(f"Downloading {len(new_files)} new file(s)...")
                         downloaded = []
                         for fname in new_files:
@@ -1004,6 +1115,7 @@ def run(resync: bool = False, _lock=None) -> bool:
                                 )
                                 downloaded.append(path)
                                 session_downloads += 1
+                                _status_inc_files_done()
                             except Exception as e:
                                 log.error(f"Failed to download {fname}: {e}")
                             finally:
@@ -1064,10 +1176,18 @@ def run(resync: bool = False, _lock=None) -> bool:
                     # --- Phase 1b: Screenshot download (opt-in) ---
                     # Runs while still on FlashAir, after the CSV path.
                     # Wrapped so a screenshot failure doesn't tank the CSV sync.
-                    if cfg.screenshots_enabled:
+                    # `new_shots` was pre-enumerated above so the dashboard's
+                    # session totals were known from the start of the cycle.
+                    if cfg.screenshots_enabled and new_shots:
+                        _status_set_stage(
+                            "downloading_shots", files_total=len(new_shots),
+                        )
                         try:
-                            shot_n = download_screenshots(cfg, resync=resync)
+                            shot_n = download_screenshots(
+                                cfg, new_shots, resync=resync,
+                            )
                             session_downloads += shot_n
+                            session_shot_downloads = shot_n
                         except Exception as e:
                             log.error(f"Screenshot download phase failed: {e}")
             finally:
@@ -1084,6 +1204,7 @@ def run(resync: bool = False, _lock=None) -> bool:
         if to_scp:
             did_work = True
             log.info(f"{len(to_scp)} file(s) pending SCP.")
+            _status_set_stage("uploading_logs", files_total=len(to_scp))
             transferred = scp_files(cfg, to_scp)
             scp_ok = (transferred == len(to_scp))
         else:
@@ -1098,8 +1219,15 @@ def run(resync: bool = False, _lock=None) -> bool:
             if pending_shots:
                 did_work = True
                 log.info(f"{len(pending_shots)} BMP(s) pending SCP.")
+                _status_set_stage("uploading_shots", files_total=len(pending_shots))
                 shots_transferred = scp_screenshots(cfg, pending_shots)
                 shots_ok = (shots_transferred == len(pending_shots))
+            # Even when nothing was pending right now, a download cycle that
+            # processed shots in Phase 1b counts as a completed shot sync.
+            if shots_transferred or session_shot_downloads:
+                _status_record_shot_sync(
+                    shots_transferred or session_shot_downloads,
+                )
 
         # --- Phase 3: Cleanup old local files ---
         wm = load_last_synced()
@@ -1121,6 +1249,10 @@ def run(resync: bool = False, _lock=None) -> bool:
         return not all_ok
 
     finally:
+        # Always return to idle so the dashboard reflects "between cycles".
+        # On the next cycle's first call, _status_set_stage("scanning")
+        # immediately takes over.
+        _status_set_stage("idle")
         if own_lock:
             release_lock(lock)
 
