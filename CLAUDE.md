@@ -21,7 +21,26 @@ Key mechanisms:
 - **Cooldown** (`.last_sync` file mtime) prevents re-scanning FlashAir for 30 min after a successful download. Only set on *complete* downloads — partial failures retry promptly.
 - **Lock file** (`.lock` with `fcntl.flock`) prevents concurrent runs. Daemon holds lock for its entire lifetime.
 - **Interruptible sleep** — daemon sleeps in 1-second increments so SIGTERM/SIGINT are handled promptly.
-- **Status file** (`--daemon` only) — atomically writes `{epoch, last_sync_epoch, last_sync_files_n, transferring, current_file}` to `/run/heater-flashair.json` (tmpfs, 0664 perms) on every state change. The hangar-controller web UI runs on the SAME Pi as a separate process (Apache mod_wsgi for `remote-switch`) and reads this file directly at page-render time — no HTTP, no localhost loopback. Module-level dict + `threading.Lock`; hooks live around the `download_file()` call sites and at the end of the "we reached the card" branch. Cron-only installs (no `--daemon`) don't write the file because there's no long-lived process to maintain it.
+- **Status file** (`--daemon` only) — atomically writes the current pipeline status to `/run/heater-flashair.json` (tmpfs, 0664 perms) on every state change. The hangar-controller web UI runs on the SAME Pi as a separate process (Apache mod_wsgi for `remote-switch`) and reads this file directly at page-render time — no HTTP, no localhost loopback. Module-level dict + `threading.Lock`. Cron-only installs (no `--daemon`) don't write the file because there's no long-lived process to maintain it. Shape:
+    ```json
+    {
+      "epoch": <int>,               // when this snapshot was taken
+      "stage": "idle" | "scanning"
+             | "downloading_logs" | "downloading_shots"
+             | "uploading_logs"   | "uploading_shots",
+      "files_done": <int>,          // current stage's progress
+      "files_total": <int>,
+      "session_csv_n": <int>,       // CSVs being processed this cycle
+      "session_shots_n": <int>,     // BMPs being processed this cycle
+      "last_sync_epoch": <int|null>,
+      "last_sync_files_n": <int>,
+      "last_shot_sync_epoch": <int|null>,
+      "last_shot_sync_files_n": <int>,
+      "transferring": <bool>,       // back-compat with v0 consumers
+      "current_file": <str|null>    // back-compat
+    }
+    ```
+    Stage transitions are linear: `idle → scanning → downloading_logs → downloading_shots → uploading_logs → uploading_shots → idle`. Empty phases are skipped (e.g., `downloading_shots` only runs when there are new BMPs and screenshots are configured). `session_csv_n` / `session_shots_n` are set once at the start of a cycle from the FlashAir directory listings, so consumers can show "N shots queued" alongside CSV progress.
 
 ## Files
 

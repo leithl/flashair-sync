@@ -228,29 +228,41 @@ If none of the `*_SHOT_DIR` vars are set, this path is inert — existing CSV-on
 
 ## Status file
 
-When running in `--daemon` mode the script writes its current sync status to `/run/heater-flashair.json` (tmpfs) on every state change — sync session complete, transferring on, transferring off. Writes are atomic (`temp + os.replace`), 0664 perms so a non-owner consumer (e.g. Apache mod_wsgi running as `www-data` on the same host) can read it.
+When running in `--daemon` mode the script writes its current sync status to `/run/heater-flashair.json` (tmpfs) on every state change — stage transitions, per-file progress, sync session completions. Writes are atomic (`temp + os.replace`), 0664 perms so a non-owner consumer (e.g. Apache mod_wsgi running as `www-data` on the same host) can read it.
 
-Example contents:
+Example contents (mid-cycle, downloading the 3rd of 7 CSVs while 5 BMPs wait their turn):
 
 ```json
 {
   "epoch": 1779391430,
-  "last_sync_epoch": 1779391429,
+  "stage": "downloading_logs",
+  "files_done": 2,
+  "files_total": 7,
+  "session_csv_n": 7,
+  "session_shots_n": 5,
+  "last_sync_epoch": 1779302190,
   "last_sync_files_n": 12,
-  "transferring": false,
-  "current_file": null
+  "last_shot_sync_epoch": 1779302195,
+  "last_shot_sync_files_n": 4,
+  "transferring": true,
+  "current_file": "log_YYYYMMDD_HHMMSS_KXXX.csv"
 }
 ```
 
 Fields:
 
 - `epoch` — clock time when this snapshot was written.
-- `last_sync_epoch` — when the daemon most recently reached the card and processed its files (whether 0 or N were downloaded). `null` until the first such cycle; primed from `.last_sync`'s mtime on daemon restart so the signal survives across restarts.
-- `last_sync_files_n` — count of files actually downloaded in that most-recent reach-the-card cycle (0 if there was nothing new). Resets to `0` across daemon restart.
-- `transferring` — `true` while a `download_file()` call from the FlashAir HTTP API is in-flight.
-- `current_file` — filename being downloaded, else `null`.
+- `stage` — current pipeline phase. Linear progression: `idle` → `scanning` → `downloading_logs` → `downloading_shots` → `uploading_logs` → `uploading_shots` → `idle`. Empty phases are skipped (e.g., `downloading_shots` only runs when there are new BMPs and screenshots are configured).
+- `files_done` / `files_total` — progress within the current stage.
+- `session_csv_n` — total CSVs being processed this cycle (new since the last watermark). Set once after the FlashAir listing, before any download begins. Stays set through `idle` so the dashboard can show "7 logs done" while shots are uploading.
+- `session_shots_n` — total BMPs being processed this cycle. Same lifecycle as `session_csv_n`. Lets a consumer show "5 shots queued" during the logs phase.
+- `last_sync_epoch` — when the daemon most recently reached the card and processed its CSVs. `null` until the first such cycle; primed from `.last_sync`'s mtime on daemon restart.
+- `last_sync_files_n` — count of CSVs actually downloaded in that most-recent reach-the-card cycle. Resets to `0` across daemon restart.
+- `last_shot_sync_epoch` / `last_shot_sync_files_n` — parallel of the above for the BMP pipeline. `null` / `0` until the first shot cycle since daemon restart.
+- `transferring` — `true` while a `download_file()` or SCP is in-flight. Retained for back-compat with v0 consumers (use `stage != "idle"` for the same signal in the new contract).
+- `current_file` — filename being transferred, else `null`.
 
-Consumers should treat the file as stale if it's missing or if `now - epoch > 120s` (the daemon writes at least at every sync cycle, and the transferring flag flips per file). The companion [remote-switch](https://github.com/leithl/remote-switch) hangar controller runs on the same Pi as a separate WSGI process and reads this file at page-render time to surface "FlashAir: N files, X ago" on its UI.
+Consumers should treat the file as stale if it's missing or if `now - epoch > 120s` (the daemon writes at least once per stage transition and once per per-file event). The companion [remote-switch](https://github.com/leithl/remote-switch) hangar controller runs on the same Pi as a separate WSGI process and reads this file at page-render time to surface FlashAir progress on its UI and its dashboard OLED.
 
 ## Troubleshooting
 
