@@ -1309,6 +1309,14 @@ def run_daemon(resync_first: bool = False) -> None:
             except Exception:
                 log.exception("Unexpected error during sync cycle")
 
+            # Heartbeat: rewrite the status file (refreshes `epoch`) before the
+            # sleep so a glance-only consumer can distinguish "daemon alive but
+            # idle" from "daemon died after last state change". Without this,
+            # `epoch` only updates on stage transitions — during long idle
+            # stretches (e.g., 30 min cooldown) the file looks stale even
+            # though we're healthy.
+            _write_status()
+
             if needs_retry:
                 log.info("SCP incomplete, retrying in %ds", poll)
                 _interruptible_sleep(poll)
