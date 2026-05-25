@@ -1309,24 +1309,34 @@ def run_daemon(resync_first: bool = False) -> None:
             except Exception:
                 log.exception("Unexpected error during sync cycle")
 
-            # Heartbeat: rewrite the status file (refreshes `epoch`) before the
-            # sleep so a glance-only consumer can distinguish "daemon alive but
-            # idle" from "daemon died after last state change". Without this,
-            # `epoch` only updates on stage transitions — during long idle
-            # stretches (e.g., 30 min cooldown) the file looks stale even
-            # though we're healthy.
+            # Heartbeat: rewrite the status file (refreshes `epoch`) so a
+            # consumer can distinguish "daemon alive" from "daemon died". We
+            # also re-fire the heartbeat *during* long sleeps below — without
+            # that a 30-min cooldown sleep makes the file look stale (120s
+            # consumer threshold) even though we're healthy.
             _write_status()
 
             if needs_retry:
                 log.info("SCP incomplete, retrying in %ds", poll)
-                _interruptible_sleep(poll)
+                target_sleep = poll
             else:
                 remaining = _remaining_cooldown_seconds()
                 if remaining > 0:
                     log.debug("In cooldown, sleeping %.0fs", remaining)
-                    _interruptible_sleep(remaining)
+                    target_sleep = remaining
                 else:
-                    _interruptible_sleep(poll)
+                    target_sleep = poll
+
+            # Break the sleep into ~60s chunks so the heartbeat keeps firing.
+            # 60s is well under the consumer's 120s stale threshold, leaving
+            # one missed-heartbeat of grace.
+            HEARTBEAT_CHUNK = 60
+            while target_sleep > 0 and not _shutdown:
+                chunk = min(target_sleep, HEARTBEAT_CHUNK)
+                _interruptible_sleep(chunk)
+                target_sleep -= chunk
+                if not _shutdown and target_sleep > 0:
+                    _write_status()
 
         log.info("Daemon stopped.")
     finally:
