@@ -1055,6 +1055,12 @@ def run(resync: bool = False, _lock=None) -> bool:
                     log.error("Cannot reach FlashAir HTTP server.")
                 else:
                     reached_card = True
+                    # SSID was sampled right after select_network (line above), but
+                    # wpa_supplicant hadn't finished associating yet — the value got
+                    # written as None. Now that HTTP works, association is proven;
+                    # re-sample so the dashboard stops painting "no wifi" red while
+                    # downloads run.
+                    _status_set_ssid(get_current_ssid(iface))
                     remote_files = list_flashair_files(cfg.flashair_ip, cfg.flashair_dir)
                     log.info(f"Found {len(remote_files)} CSV(s) on FlashAir.")
 
