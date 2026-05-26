@@ -10,7 +10,11 @@ User=pi
 # aren't configured (an empty tmpfs dir).
 RuntimeDirectory=flashair-shots
 WorkingDirectory=%h/flashair-sync
-ExecStart=%h/flashair-sync/venv/bin/python %h/flashair-sync/flashair_sync.py --daemon
+# `-u` forces unbuffered stdout/stderr so INFO logs reach the journal
+# in real time instead of sitting in a Python stdio buffer until the
+# daemon exits (or is killed, in which case they're lost). Without it,
+# any cycle that doesn't trigger an error has no journal trace at all.
+ExecStart=%h/flashair-sync/venv/bin/python -u %h/flashair-sync/flashair_sync.py --daemon
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
