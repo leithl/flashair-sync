@@ -1065,30 +1065,25 @@ def run(resync: bool = False, _lock=None) -> bool:
                     if skipped:
                         log.info(f"Skipped {len(skipped)} already-synced file(s).")
 
-                    # Skip the file that's still being written by the
-                    # avionics. Only the most recent CSV on the SD card can
-                    # be the active one (avionics writes serially: it
-                    # closes file N before opening file N+1). So the
-                    # stability check only needs to run on the newest
-                    # candidate; everything older is already closed.
+                    # Walk oldest → newest. Only the most recent CSV on the
+                    # SD card can be the actively-written one (avionics
+                    # writes serially: it closes file N before opening file
+                    # N+1), so everything older is already closed and safe
+                    # to download without a stability check.
                     #
-                    # Without this guard we'd grab a partial snapshot
-                    # (e.g. 34 sec of pre-flight engine warmup captured as
-                    # the start of a 2-hour flight), the watermark would
-                    # advance past it, and we'd never re-pull the
-                    # complete file. Next sync re-checks any file we
-                    # defer here.
+                    # Downloading the closed files BEFORE the 90s stability
+                    # check on the newest means a mid-cycle connection drop
+                    # — e.g. the plane moves out of FlashAir range during
+                    # the stability sleep — doesn't lose the closed files.
+                    # Previously, an exception raised inside
+                    # filter_stable_files would propagate past the download
+                    # loop and skip everything in this cycle.
                     if new_files:
-                        newest = new_files[-1]  # new_files is sorted
-                        stable, unstable = filter_stable_files(
-                            cfg.flashair_ip, cfg.flashair_dir, [newest],
-                        )
-                        if unstable:
-                            log.info(
-                                f"Deferring actively-written file: {unstable[0]} "
-                                f"(will retry next cycle)"
-                            )
-                            new_files = new_files[:-1]  # all but the unstable one
+                        candidate_active = new_files[-1]
+                        older_closed = new_files[:-1]
+                    else:
+                        candidate_active = None
+                        older_closed = []
 
                     # Pre-enumerate screenshots so the dashboard can show
                     # "N shots queued" alongside CSV progress. Done before
@@ -1126,34 +1121,94 @@ def run(resync: bool = False, _lock=None) -> bool:
                         _status_set_stage(
                             "downloading_logs", files_total=len(new_files),
                         )
-                        log.info(f"Downloading {len(new_files)} new file(s)...")
-                        downloaded = []
-                        for fname in new_files:
-                            _status_set_transferring(fname)
+                        downloaded: list[str] = []
+                        deferred_active = False
+
+                        # Phase A: download the known-closed older files.
+                        if older_closed:
+                            log.info(
+                                f"Downloading {len(older_closed)} closed file(s)..."
+                            )
+                            for fname in older_closed:
+                                _status_set_transferring(fname)
+                                try:
+                                    path = download_file(
+                                        cfg.flashair_ip, cfg.flashair_dir,
+                                        fname, cfg.local_csv_dir,
+                                    )
+                                    downloaded.append(path)
+                                    session_downloads += 1
+                                    _status_inc_files_done()
+                                except Exception as e:
+                                    log.error(f"Failed to download {fname}: {e}")
+                                finally:
+                                    _status_clear_transferring()
+                            if downloaded:
+                                save_last_synced(
+                                    max(Path(p).name for p in downloaded)
+                                )
+
+                        # Phase B: stability check on the (potentially
+                        # active) newest, then download if stable. The
+                        # try/except converts a connection-drop during the
+                        # 90s poll into a deferral instead of an unhandled
+                        # exception that would skip the rest of the cycle.
+                        try:
+                            stable, _unstable = filter_stable_files(
+                                cfg.flashair_ip, cfg.flashair_dir,
+                                [candidate_active],
+                            )
+                        except Exception as e:
+                            log.warning(
+                                f"Stability check on {candidate_active} "
+                                f"failed ({e}); deferring to next cycle."
+                            )
+                            stable, _unstable = [], [candidate_active]
+
+                        if _unstable:
+                            log.info(
+                                f"Deferring actively-written file: "
+                                f"{_unstable[0]} (will retry next cycle)"
+                            )
+                            deferred_active = True
+                        elif stable:
+                            _status_set_transferring(candidate_active)
                             try:
                                 path = download_file(
                                     cfg.flashair_ip, cfg.flashair_dir,
-                                    fname, cfg.local_csv_dir,
+                                    candidate_active, cfg.local_csv_dir,
                                 )
                                 downloaded.append(path)
                                 session_downloads += 1
                                 _status_inc_files_done()
+                                save_last_synced(candidate_active)
                             except Exception as e:
-                                log.error(f"Failed to download {fname}: {e}")
+                                log.error(
+                                    f"Failed to download "
+                                    f"{candidate_active}: {e}"
+                                )
                             finally:
                                 _status_clear_transferring()
 
-                        if downloaded:
-                            newest = max(Path(p).name for p in downloaded)
-                            save_last_synced(newest)
-                            if len(downloaded) == len(new_files):
-                                _touch_cooldown()
-                                log.info(f"Cooldown set ({_cooldown_minutes()}m).")
-                            else:
-                                log.warning(
-                                    "Downloaded %d/%d file(s); will retry remaining on next cycle.",
-                                    len(downloaded), len(new_files),
+                        # Cooldown: set when we got everything we could
+                        # this cycle. A deferred active file is expected
+                        # (next cycle will pick it up once it's closed),
+                        # so it doesn't count against the "complete" bar.
+                        expected_dl = len(new_files) - (
+                            1 if deferred_active else 0
+                        )
+                        if len(downloaded) == expected_dl:
+                            _touch_cooldown()
+                            if downloaded:
+                                log.info(
+                                    f"Cooldown set ({_cooldown_minutes()}m)."
                                 )
+                        else:
+                            log.warning(
+                                "Downloaded %d/%d file(s); will retry "
+                                "remaining on next cycle.",
+                                len(downloaded), len(new_files),
+                            )
 
                     # Lookback pass: catch any partials the stability check
                     # may have let slip through (e.g. flush-gap false stable).
