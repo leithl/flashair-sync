@@ -998,7 +998,7 @@ def scp_files(cfg: Config, local_paths: list[str]) -> int:
 # Main
 # ---------------------------------------------------------------------------
 
-def run(resync: bool = False, _lock=None) -> bool:
+def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool:
     cfg = load_config()
 
     # Acquire exclusive lock (prevents overlapping cron runs).
@@ -1033,7 +1033,7 @@ def run(resync: bool = False, _lock=None) -> bool:
         # --- Phase 1: Download from FlashAir (if available) ---
         if already_on_flashair:
             log.info("Already on FlashAir (recovery from previous run).")
-        elif _in_cooldown() and not resync:
+        elif _in_cooldown() and not resync and not bypass_cooldown:
             log.debug(f"In cooldown (last sync < {_cooldown_minutes()}m ago), skipping FlashAir.")
         elif not current:
             log.warning("WiFi disconnected. Attempting to reconnect home...")
@@ -1365,7 +1365,20 @@ def run_daemon(resync_first: bool = False) -> None:
         while not _shutdown:
             needs_retry = False
             try:
-                needs_retry = run(resync=(resync_first and first), _lock=lock)
+                # First cycle after daemon start bypasses cooldown so we
+                # re-poll FlashAir even if `.last_sync` is recent. The BMP
+                # staging dir lives on tmpfs (systemd RuntimeDirectory),
+                # so any screenshots that were downloaded but not yet SCP'd
+                # vanish on service restart — without a forced re-scan
+                # they're invisible until the cooldown elapses (up to 30m).
+                # The CSV path is unaffected (persistent dir + watermark),
+                # so this only matters when screenshots are configured, but
+                # bypassing is harmless when they aren't.
+                needs_retry = run(
+                    resync=(resync_first and first),
+                    bypass_cooldown=first,
+                    _lock=lock,
+                )
                 first = False
             except Exception:
                 log.exception("Unexpected error during sync cycle")
