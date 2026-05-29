@@ -1304,7 +1304,12 @@ def run(resync: bool = False, _lock=None) -> bool:
                             shot_n = download_screenshots(
                                 cfg, new_shots, resync=resync,
                             )
-                            session_downloads += shot_n
+                            # session_downloads counts CSV logs only — it is
+                            # recorded as last_sync_files_n (the "N logs"
+                            # tally). Shots are tracked separately in
+                            # session_shot_downloads → last_shot_sync_files_n.
+                            # Folding shots in here double-counted them as logs:
+                            # 1 log + 8 shots rendered as "9 logs + 8 shots".
                             session_shot_downloads = shot_n
                         except Exception as e:
                             log.error(f"Screenshot download phase failed: {e}")
