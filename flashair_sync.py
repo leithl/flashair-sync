@@ -313,9 +313,10 @@ _status_lock = threading.Lock()
 _status: dict = {
     # Pipeline stage (added 2026-05-21). Lets a glance-only consumer surface
     # *what* is happening, not just whether something is. Linear progression:
-    #   idle → scanning → downloading_logs → downloading_shots
-    #        → uploading_logs → uploading_shots → idle
-    # Stages may be skipped when their phase has no new work.
+    #   idle → scanning → checking_logs → downloading_logs
+    #        → downloading_shots → uploading_logs → uploading_shots → idle
+    # checking_logs is the 90s stability poll on the newest CSV (no transfer
+    # happens during it). Stages may be skipped when their phase has no work.
     "stage": "idle",
 
     # Per-stage progress — current stage's "X of Y files".
@@ -377,6 +378,25 @@ def _write_status() -> None:
         os.replace(str(tmp), str(FLASHAIR_STATUS_FILE))
     except OSError as e:
         log.debug(f"Status file write failed: {e}")
+
+
+def _sleep_with_heartbeat(total_secs: float, chunk_secs: int = 30) -> None:
+    """Sleep `total_secs`, rewriting the status file every `chunk_secs`.
+
+    Without this, a long in-cycle wait — the 90s stability check in
+    filter_stable_files — writes no status, so the epoch ages toward a
+    consumer's staleness threshold (remote-switch trips at 120s and paints
+    "sync service down") even though we're healthy, and the dashboard freezes
+    on whatever stage preceded the sleep. Mirrors run_daemon's
+    heartbeat-during-sleep for the *between*-cycle case.
+    """
+    remaining = total_secs
+    while remaining > 0:
+        nap = min(remaining, chunk_secs)
+        time.sleep(nap)
+        remaining -= nap
+        if remaining > 0:
+            _write_status()
 
 
 def _status_set_transferring(filename: str) -> None:
@@ -651,7 +671,9 @@ def filter_stable_files(
     if not candidates:
         return [], []
     first = list_flashair_files_with_sizes(ip, directory)
-    time.sleep(delay_sec)
+    # Heartbeat through the long wait so the dashboard's "updated Xs ago"
+    # stays fresh instead of aging into a false "sync service down".
+    _sleep_with_heartbeat(delay_sec)
     second = list_flashair_files_with_sizes(ip, directory)
     stable, unstable = [], []
     for f in candidates:
@@ -1159,6 +1181,12 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
                         # try/except converts a connection-drop during the
                         # 90s poll into a deferral instead of an unhandled
                         # exception that would skip the rest of the cycle.
+                        #
+                        # Surface a distinct "checking_logs" stage: nothing
+                        # downloads during the 90s poll, so leaving the stage
+                        # on "downloading_logs" made a single-log sync look
+                        # hung on "0 of 1" for the whole check.
+                        _status_set_stage("checking_logs", files_total=1)
                         try:
                             stable, _unstable = filter_stable_files(
                                 cfg.flashair_ip, cfg.flashair_dir,
@@ -1178,6 +1206,13 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
                             )
                             deferred_active = True
                         elif stable:
+                            # Resume the download stage, restoring progress
+                            # from any older_closed files already pulled
+                            # (set_stage above reset files_done to 0).
+                            with _status_lock:
+                                _status["stage"] = "downloading_logs"
+                                _status["files_total"] = len(new_files)
+                                _status["files_done"] = len(downloaded)
                             _status_set_transferring(candidate_active)
                             try:
                                 path = download_file(
@@ -1269,7 +1304,12 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
                             shot_n = download_screenshots(
                                 cfg, new_shots, resync=resync,
                             )
-                            session_downloads += shot_n
+                            # session_downloads counts CSV logs only — it is
+                            # recorded as last_sync_files_n (the "N logs"
+                            # tally). Shots are tracked separately in
+                            # session_shot_downloads → last_shot_sync_files_n.
+                            # Folding shots in here double-counted them as logs:
+                            # 1 log + 8 shots rendered as "9 logs + 8 shots".
                             session_shot_downloads = shot_n
                         except Exception as e:
                             log.error(f"Screenshot download phase failed: {e}")

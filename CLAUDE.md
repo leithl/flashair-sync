@@ -25,7 +25,7 @@ Key mechanisms:
     ```json
     {
       "epoch": <int>,               // when this snapshot was taken
-      "stage": "idle" | "scanning"
+      "stage": "idle" | "scanning" | "checking_logs"
              | "downloading_logs" | "downloading_shots"
              | "uploading_logs"   | "uploading_shots",
       "files_done": <int>,          // current stage's progress
@@ -41,7 +41,7 @@ Key mechanisms:
       "current_file": <str|null>    // back-compat
     }
     ```
-    Stage transitions are linear: `idle → scanning → downloading_logs → downloading_shots → uploading_logs → uploading_shots → idle`. Empty phases are skipped (e.g., `downloading_shots` only runs when there are new BMPs and screenshots are configured). `session_csv_n` / `session_shots_n` are set once at the start of a cycle from the FlashAir directory listings, so consumers can show "N shots queued" alongside CSV progress.
+    Stage transitions are linear: `idle → scanning → checking_logs → downloading_logs → downloading_shots → uploading_logs → uploading_shots → idle`. Empty phases are skipped (e.g., `downloading_shots` only runs when there are new BMPs and screenshots are configured). `checking_logs` is the ~90s stability poll on the newest CSV (confirming the avionics finished writing it) — **no transfer happens during it**, so consumers should render it distinctly rather than as `downloading_logs` 0-of-N, which made a single-log sync look hung. The status file is heartbeat-rewritten throughout the poll so `epoch` stays fresh. `session_csv_n` / `session_shots_n` are set once at the start of a cycle from the FlashAir directory listings, so consumers can show "N shots queued" alongside CSV progress.
 
 ## Files
 

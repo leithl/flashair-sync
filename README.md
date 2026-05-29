@@ -253,7 +253,7 @@ Example contents (mid-cycle, downloading the 3rd of 7 CSVs while 5 BMPs wait the
 Fields:
 
 - `epoch` — clock time when this snapshot was written.
-- `stage` — current pipeline phase. Linear progression: `idle` → `scanning` → `downloading_logs` → `downloading_shots` → `uploading_logs` → `uploading_shots` → `idle`. Empty phases are skipped (e.g., `downloading_shots` only runs when there are new BMPs and screenshots are configured).
+- `stage` — current pipeline phase. Linear progression: `idle` → `scanning` → `checking_logs` → `downloading_logs` → `downloading_shots` → `uploading_logs` → `uploading_shots` → `idle`. Empty phases are skipped (e.g., `downloading_shots` only runs when there are new BMPs and screenshots are configured). `checking_logs` is the ~90s stability poll on the newest CSV — **no transfer happens during it** (the status file is heartbeat-rewritten so `epoch` stays fresh); render it distinctly so a single-log sync doesn't look hung on `downloading_logs` 0-of-N.
 - `files_done` / `files_total` — progress within the current stage.
 - `session_csv_n` — total CSVs being processed this cycle (new since the last watermark). Set once after the FlashAir listing, before any download begins. Stays set through `idle` so the dashboard can show "7 logs done" while shots are uploading.
 - `session_shots_n` — total BMPs being processed this cycle. Same lifecycle as `session_csv_n`. Lets a consumer show "5 shots queued" during the logs phase.

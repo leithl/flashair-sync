@@ -5,3 +5,7 @@ csvs/
 .lock
 .last_sync
 flashair_sync_macos.py
+__pycache__/
+.DS_Store
+data_log/
+.claude/
