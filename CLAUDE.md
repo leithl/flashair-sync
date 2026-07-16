@@ -19,7 +19,7 @@ Three-phase sync cycle, run either as a systemd daemon (recommended) or via cron
 Two link modes for step 1 (`LINK_MODE` in `.env`, default `ap`):
 
 - **ap** (default) — the card is its own AP. The Pi's `wlan0` leaves the home network (wpa_cli scan → temporary network → download → `try/finally` reconnect). Internet/SSH on the Pi die for the duration of every hop.
-- **sta** — the card has been reconfigured (`APPMODE` station mode — design doc + card runbook in `docs/appmode5-sta.md`) to join an AP the Pi already hosts/reaches (e.g. a hostapd `uap0`). Step 1's detection is a single short HTTP probe of the card's static DHCP lease (`FLASHAIR_IP`, required in this mode); the radio never moves and `wpa_cli` goes unused. Watermarks, stability check, lookback rescue, SCP, and cooldown logic are identical in both modes. `FLASHAIR_SSID`/`FLASHAIR_PASSWORD`/`HOME_*` are unused in sta mode.
+- **sta** — the card has been reconfigured (`APPMODE` station mode — design doc + card runbook in `docs/appmode5-sta.md`) to join an AP the Pi already hosts/reaches (e.g. a hostapd `uap0`). Step 1's detection is a single short HTTP probe of the card's static DHCP lease (`FLASHAIR_IP`, required in this mode); the radio never moves and the `wpa_cli` hop machinery goes unused (`wpa_cli` itself still runs for the cycle-start SSID sample and, when `HOME_SSID` is set, the uplink self-heal). Watermarks, stability check, lookback rescue, SCP, and cooldown logic are identical in both modes. `FLASHAIR_SSID`/`FLASHAIR_PASSWORD`/`HOME_PASSWORD` are unused in sta mode.
 
 Key mechanisms:
 - **Watermarks** (`LAST_SYNCED`, `LAST_SCPD` for CSVs; `LAST_SHOT_SCPD` for BMPs) in `.env` track progress across restarts. Files sort lexicographically by name = chronologically.

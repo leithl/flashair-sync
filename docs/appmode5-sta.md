@@ -128,6 +128,7 @@ All in the `[Vendor]` section of `/SD_WLAN/CONFIG`
 | `APPSSID=<ap-ssid>` | The AP to join. 1–32 chars, no spaces. |
 | `APPNETWORKKEY=<ap-passphrase>` | WPA2 passphrase, 8–63 chars, no spaces. **The card rewrites this line to `********` on its next boot** and stores the real key internally — expected, not corruption. A later CONFIG rewrite that keeps the asterisks preserves the stored key; writing a new plaintext value re-sets it. |
 | `STA_RETRY_CT=0` | Join-retry count, `0` = retry indefinitely (FW 3.00.00+). The default is undocumented, so set it explicitly — a briefly-down AP at card power-on then costs minutes, not the whole session. |
+| `MASTERCODE=<12-hex-digits>` | Pre-claims the card. With no MASTERCODE set, the **first** `config.cgi` caller to offer one claims the card (§5.1) — and in station mode every client on the AP LAN can reach `config.cgi`. Pick any 12 hex digits, set it during the offline edit, record it privately. |
 
 Facts that shape the rest of the design:
 
@@ -163,8 +164,8 @@ Two remote paths exist; neither should be used for this cutover:
   and could do the whole flip in one call —
   `config.cgi?MASTERCODE=<12hex>&APPMODE=5&APPSSID=…&APPNETWORKKEY=…` — after
   which **the card reboots itself** into station mode. On a never-configured card
-  (this one: factory SSID and default password) the first MASTERCODE offered
-  claims the card. Rejected as a *remote* action because the failure mode is
+  (factory SSID and default password) the first MASTERCODE offered claims the
+  card. Rejected as a *remote* action because the failure mode is
   one-way: the call succeeds, the card reboots as a station, and if it then fails
   to join the AP there is no card AP left to reach it by — recovery is a physical
   visit anyway. It is also a card-side write to CONFIG while the host device has
@@ -190,12 +191,14 @@ anyway (§8), it adds no extra trips.
    firmware/web-app files and permanently kills the WiFi features.
 3. Enable hidden-file display and open `/SD_WLAN/CONFIG` (plain text, INI-style;
    the `[Vendor]` section holds the `APP*` parameters).
-4. In `[Vendor]`, set/add the four lines from §4.3. Leave every other line —
+4. In `[Vendor]`, set/add the five lines from §4.3. Leave every other line —
    `VERSION=`, `CID=`, `LOCK=`, etc. — untouched, and preserve the file's
    existing line-ending style.
 5. While in there, note the `VERSION=` value (model + firmware, §4.1).
-6. Save, cleanly eject, reinsert in the panel.
-7. Verify per §8 step 4 — association, ping, `op=100` listing, and at least two
+6. Save, cleanly eject, confirm the card's side lock tab is still in the
+   unlocked position (reader insertion/removal can nudge it — a locked card
+   means the panel can't write new logs at all), and reinsert in the panel.
+7. Verify per §8 step 5 — association, ping, `op=100` listing, and at least two
    panel power cycles — before flipping `.env`.
 
 After the card's first station-mode boot, `APPNETWORKKEY` in CONFIG will read
@@ -214,9 +217,13 @@ dhcp-host=<card-mac>,192.168.50.20,flashair
 ```
 
 `<card-mac>` is the hex tail of the card's factory SSID, colon-separated
-(`flashair_a1b2c3d4e5f6` → `a1:b2:c3:d4:e5:f6`). Then `sudo systemctl restart
-dnsmasq`. The lease name `flashair` is cosmetic but makes `dnsmasq.leases` /
-`arp` output self-describing.
+(`flashair_a1b2c3d4e5f6` → `a1:b2:c3:d4:e5:f6`). Note that SSID-tail-equals-WiFi-MAC
+is a community-observed convention, not a documented guarantee — treat it as the
+starting value, and confirm the authoritative MAC from the AP side on the card's
+first association (`iw dev <ap-if> station dump`, or the new `dnsmasq.leases`
+entry), correcting the `dhcp-host` line if they differ (§8 step 5 covers this).
+Then `sudo systemctl restart dnsmasq`. The lease name `flashair` is cosmetic but
+makes `dnsmasq.leases` / `arp` output self-describing.
 
 ### 6.2 hostapd
 
@@ -232,8 +239,10 @@ No changes needed for a typical WPA2 AP; checks worth making:
   radio with a station-mode `wlan0` (the usual Pi `uap0` arrangement), the AP is
   pinned to whatever channel `wlan0`'s upstream network uses. If that upstream AP
   changes channel, the virtual AP — and every client on it, now including the card —
-  drops until they re-agree. This constraint predates this design (it applies to all
-  `uap0` clients); it just gains one more rider.
+  drops until they re-agree. In particular, if the upstream association is 5 GHz,
+  the virtual AP is 5 GHz too and the card can never join (it's 2.4 GHz ch 1–11
+  only, §4.3). This constraint predates this design (it applies to all `uap0`
+  clients); it just gains one more rider.
 
 ### 6.3 `.env`
 
@@ -243,8 +252,11 @@ FLASHAIR_IP=192.168.50.20
 ```
 
 `FLASHAIR_IP` is **required** in sta mode (the card is no longer at the well-known
-`192.168.0.1`). `FLASHAIR_SSID`, `FLASHAIR_PASSWORD`, `HOME_SSID`, `HOME_PASSWORD`
-become unused — leave them in place for easy rollback. Watermarks (`LAST_SYNCED`,
+`192.168.0.1`) — and it is the one variable a rollback must revert, back to
+`192.168.0.1` (§9). `FLASHAIR_SSID`, `FLASHAIR_PASSWORD`, `HOME_PASSWORD` become
+unused; `HOME_SSID` is still consulted by the uplink self-heal (rejoin `wlan0` to
+the home network if it drops), so keep it set on a host whose uplink is that WiFi.
+Leave them all in place for easy rollback. Watermarks (`LAST_SYNCED`,
 `LAST_SCPD`, `LAST_SHOT_SCPD`) carry over untouched: same card, same filenames, so
 nothing re-downloads after the switch.
 
@@ -259,9 +271,11 @@ Implemented in this repo behind the `LINK_MODE` flag:
   exactly as if the AP-mode join had completed; failure ⇒ "card powered off",
   retry next cycle. No scan, no `wpa_cli`, no `reconnect_home()` in the
   post-download `finally`.
-- **Self-heal kept**: if `wlan0` has dropped off the home network the cycle still
-  attempts `reconnect_home()` first — the SCP phase needs the uplink; the card
-  probe is unaffected either way (different interface).
+- **Self-heal kept** (when `HOME_SSID` is set): if `wlan0` has dropped off the
+  home network the cycle still attempts `reconnect_home()` first — the SCP phase
+  needs the uplink; the card probe is unaffected either way (different
+  interface). With `HOME_SSID` unset (allowed in sta mode — e.g. an ethernet
+  uplink) the self-heal is skipped: there's nothing to rejoin by name.
 - **Unchanged**: watermarks, the 90 s stability check on the newest CSV, the
   lookback rescue, screenshot path, SCP retry semantics, cooldown. Cooldown remains
   worthwhile in sta mode — not for radio cost (now ~zero) but to avoid re-listing
@@ -274,9 +288,12 @@ Implemented in this repo behind the `LINK_MODE` flag:
 - **Validation**: `LINK_MODE` must be `ap` or `sta`; sta requires `FLASHAIR_IP`;
   the WiFi-credential vars stop being required in sta.
 
-A side benefit: sta mode uses no platform-specific WiFi tooling, so the script is
-effectively platform-independent in that mode (the macOS testing variant's only
-divergence is the `networksetup` hop code, which sta never calls).
+A side benefit: sta mode never performs the WiFi hop, so the hop machinery —
+scan, temporary network, reconnect-home in the download `finally`, the
+platform-specific part of the script — goes unexercised. Note the script still
+shells out to `wpa_cli` each cycle for the status-file SSID sample and (with
+`HOME_SSID` set) the uplink self-heal, so a `wpa_supplicant`-managed host remains
+a requirement of the main script even in sta mode.
 
 ## 8. Cutover plan
 
@@ -285,15 +302,40 @@ Ordered so every intermediate state is safe:
 1. **Merge + deploy this repo with `LINK_MODE` unset.** Inert — the default is `ap`.
 2. **Add the dnsmasq static lease** (§6.1) and restart dnsmasq. Inert — the card
    hasn't joined yet.
-3. **At the site, with the panel OFF: pull the card and run the §5 runbook at a
+3. **Pre-visit, from anywhere with SSH to the host: check the AP against the
+   card's envelope** (§6.2 / §4.3). `iw dev <ap-if> info` must show 2.4 GHz,
+   channel 1–11 (on a shared single radio the AP is pinned to the upstream
+   network's channel — a 5 GHz upstream means an AP the card can never join);
+   hostapd must be WPA2-PSK/CCMP, not WPA3-only; and the AP SSID (1–32 chars) and
+   passphrase (8–63 chars) must contain no spaces, or the card's CONFIG can't
+   express them. Fix any mismatch before travelling.
+4. **At the site, with the panel OFF: pull the card and run the §5 runbook at a
    laptop** (backup card contents, edit CONFIG, reinsert).
-4. **Power the panel on. Verify from the host** before touching `.env`:
+5. **Power the panel on. Verify from the host** before touching `.env`:
    `ping 192.168.50.20`, then
-   `curl "http://192.168.50.20/command.cgi?op=100&DIR=/"`. Power-cycle the panel at
-   least twice and re-verify — re-association after power cycles is the property the
-   whole design rests on.
-5. **Flip `.env`** (§6.3), restart the daemon, watch one full sync in the journal.
-6. **Leave the site only after** step 4's power-cycle test and step 5's full sync
+   `curl "http://192.168.50.20/command.cgi?op=100&DIR=/"`, and record the
+   firmware for the log: `curl "http://192.168.50.20/command.cgi?op=108"` (§4.1).
+   Power-cycle the panel at least twice and re-verify — re-association after
+   power cycles is the property the whole design rests on.
+
+   **If the ping fails**, triage from the AP side before touching the card:
+   `iw dev <ap-if> station dump` (or `hostapd_cli all_sta`). A station present
+   plus a `dnsmasq.leases` entry at a *different* IP means the §6.1 `dhcp-host`
+   MAC was wrong (the SSID-tail heuristic missed) — fix the lease to the MAC
+   shown, restart dnsmasq, power-cycle the panel, re-verify. No station at all
+   means the card never associated — recheck the CONFIG lines (§4.3) and the
+   step 3 AP checks. Roll back (§9) only if neither branch resolves it.
+6. **Flip `.env`** (§6.3), restart the daemon, watch one full sync in the
+   journal. Know what failure looks like here: **a failing probe is silent at
+   the default INFO log level** (probe misses log at DEBUG), so a journal that
+   shows the daemon start and then nothing within a poll interval or two means
+   the probe is failing — recheck `FLASHAIR_IP` against the lease. To debug
+   interactively, stop the daemon first (`sudo systemctl stop flashair-sync`)
+   and run a one-shot `python3 flashair_sync.py -v` — a one-shot exits silently
+   while the daemon holds the lock. To force a re-check after a completed sync,
+   restart the daemon (the first cycle after start bypasses the cooldown); don't
+   use `--resync` for that — it re-downloads everything.
+7. **Leave the site only after** step 5's power-cycle test and step 6's full sync
    have both passed. If anything is off, run the rollback (§9) before leaving —
    a half-cut-over card strands logs.
 
@@ -310,21 +352,29 @@ reverted:
    masked (`********`): asterisks mean "keep the internally stored key", and after
    station-mode use the internally stored key is the *AP passphrase*, not the old
    card password — the card AP would come back with the wrong key.
-3. Reinsert, set `LINK_MODE=ap` (or delete the line) in `.env`, restart the daemon.
+   (`<old-card-password>` is the card's original AP password — still recorded on
+   the sync host as `FLASHAIR_PASSWORD` in `.env`, which §6.3 leaves in place for
+   exactly this; or the card's factory default if it was never changed.)
+3. Reinsert (re-checking the lock tab, §5.2 step 6). In `.env`, set
+   `LINK_MODE=ap` **and** `FLASHAIR_IP=192.168.0.1` — or delete both lines;
+   those are the ap-mode defaults. Leaving `FLASHAIR_IP` at the sta-mode lease
+   address would leave ap mode probing the wrong IP after every hop. Restart
+   the daemon.
 
 This is why the runbook's first step is a full-card backup, and why cutover
-verification (§8 step 6) happens before leaving the site.
+verification (§8 step 7) happens before leaving the site.
 
 ## 10. Risks
 
 | Risk | Exposure | Mitigation |
 |---|---|---|
-| Card fails to (re)join the AP in the field | Logs stranded on card until a physical visit | §8 step 4's repeated power-cycle test before leaving; `STA_RETRY_CT=0` (§4.3); logs are never lost, only delayed — the card keeps them |
+| Card fails to (re)join the AP in the field | Logs stranded on card until a physical visit | §8 step 5's repeated power-cycle test before leaving; `STA_RETRY_CT=0` (§4.3); logs are never lost, only delayed — the card keeps them |
 | AP briefly down when the card powers up (host rebooting) | Session delayed until the AP returns | `STA_RETRY_CT=0` makes the card retry joining indefinitely while powered, and station mode has no WLAN idle timeout (§4.3) — the loss window is only as long as the AP outage itself |
 | Host writes to the card while we read over HTTP | **Unchanged from AP mode** — same firmware, same HTTP server, same concurrent-write behaviour regardless of WLAN mode | Existing stability check + lookback rescue stay in place |
 | Upstream AP channel change breaks the virtual AP (single-radio) | All virtual-AP clients drop, card included | Pre-existing `uap0` constraint (§6.2); card adds no new failure mode |
 | CONFIG edit typo / card doesn't come back | Card unreachable by any mode | Full-card backup first (§5); CONFIG is plain text on FAT — re-edit at any laptop; §9 |
-| Card's HTTP server now exposed to all AP clients | Anyone on the AP LAN can browse/download card contents | AP is WPA2 with a private passphrase and only trusted clients; same trust boundary as the other AP clients |
+| Card's HTTP server now exposed to all AP clients | Anyone on the AP LAN can browse/download card contents — and a card with **no** MASTERCODE could be claimed via `config.cgi` and remotely reconfigured (§5.1) | AP is WPA2 with a private passphrase and only trusted clients; `MASTERCODE` set during the §5 edit pre-claims the card (§4.3) |
+| Host AP stack fails (hostapd/dnsmasq down, AP interface broken by a co-tenant config change) | New in sta mode: probe timeouts look exactly like "panel off" (DEBUG-only log), so stranded logs surface only when expected data never arrives | Before concluding "device not powered": `systemctl status hostapd dnsmasq`; `iw dev <ap-if> station dump` (other AP clients also missing ⇒ AP problem, not card); check `dnsmasq.leases` for the card's entry |
 | `.env` flipped before the card CONFIG (or vice versa) | Probe times out every cycle / card joins but nobody polls | Both states are safe (no data loss, just no sync); cutover order in §8 |
 
 ## 11. Open questions

@@ -236,7 +236,7 @@ By default the card acts as its own WiFi access point and the sync host must lea
 1. **Detect** — one short HTTP probe of `FLASHAIR_IP` (give the card a static DHCP lease). The card associates and answers whenever the device it sits in powers it.
 2. **Download / Transfer / Cleanup** — identical to AP mode: same watermarks, stability check, lookback rescue, SCP phase, cooldown.
 
-Benefits: no internet/SSH dropout during syncs, detection in seconds instead of a scan cycle, and the `wpa_cli` hop machinery goes unused. In `sta` mode `FLASHAIR_IP` is required, and `FLASHAIR_SSID` / `FLASHAIR_PASSWORD` / `HOME_SSID` / `HOME_PASSWORD` are unused.
+Benefits: no internet/SSH dropout during syncs, detection in seconds instead of a scan cycle, and the `wpa_cli` hop machinery goes unused (`wpa_cli` itself still runs for the status-file SSID sample and the uplink self-heal). In `sta` mode `FLASHAIR_IP` is required; `FLASHAIR_SSID` / `FLASHAIR_PASSWORD` / `HOME_PASSWORD` are unused, and `HOME_SSID` is optional — when set, the daemon still self-heals its WiFi uplink if `wlan0` drops off the home network.
 
 Card-side setup (CONFIG editing runbook, DHCP reservation, timeout tuning, rollback) is documented in [docs/appmode5-sta.md](docs/appmode5-sta.md). `LINK_MODE=ap` remains the default; existing setups see no behaviour change.
 
