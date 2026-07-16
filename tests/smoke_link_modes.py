@@ -72,6 +72,18 @@ case "$1" in
 esac
 """
 
+# Variant: wlan0 not associated to anything (no ssid= line in status).
+WPA_CLI_STUB_NOSSID = """\
+#!/bin/sh
+shift 2
+case "$1" in
+  status) echo "wpa_state=DISCONNECTED";;
+  scan) echo "OK";;
+  scan_results) printf "bssid / frequency / signal level / flags / ssid\\n";;
+  *) echo "OK";;
+esac
+"""
+
 
 class CardHandler(http.server.BaseHTTPRequestHandler):
     """Mock FlashAir: command.cgi?op=100 listings + plain-GET downloads."""
@@ -130,10 +142,12 @@ def setup_case(root, name, env_text, port):
     return d
 
 
-def run_sync(d, bin_dir):
+def run_sync(d, bin_dir, extra_env=None):
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["FLASHAIR_STABILITY_DELAY_SEC"] = "2"
+    if extra_env:
+        env.update(extra_env)
     p = subprocess.run(
         [sys.executable, "flashair_sync.py", "-v"],
         cwd=d, env=env, capture_output=True, text=True, timeout=180,
@@ -148,6 +162,11 @@ def main():
     stub = bin_dir / "wpa_cli"
     stub.write_text(WPA_CLI_STUB)
     stub.chmod(0o755)
+    bin_nossid = root / "bin-nossid"
+    bin_nossid.mkdir()
+    stub2 = bin_nossid / "wpa_cli"
+    stub2.write_text(WPA_CLI_STUB_NOSSID)
+    stub2.chmod(0o755)
 
     socketserver.TCPServer.allow_reuse_address = True
     server = socketserver.TCPServer(("127.0.0.1", 0), CardHandler)
@@ -196,6 +215,20 @@ def main():
         rc5, out5 = run_sync(d5, bin_dir)
         check("exit 1", rc5 == 1)
         check("names LINK_MODE", "LINK_MODE" in out5)
+
+        print("TEST 6: sta with no HOME_SSID + no wlan0 association skips self-heal")
+        d6 = setup_case(root, "t6", STA_ENV, port)
+        rc6, out6 = run_sync(d6, bin_nossid)
+        check("exit 0", rc6 == 0)
+        check("no reconnect attempt", "Attempting to reconnect home" not in out6)
+        check("no bogus 'Connected to'", "Connected to" not in out6)
+        check("still probes + lists", "Found 2 CSV(s) on FlashAir." in out6)
+
+        print("TEST 7: whitespace-only FLASHAIR_IP env var rejected in sta mode")
+        d7 = setup_case(root, "t7", STA_ENV.replace("FLASHAIR_IP=127.0.0.1:{port}\n", ""), port)
+        rc7, out7 = run_sync(d7, bin_dir, extra_env={"FLASHAIR_IP": "   "})
+        check("exit 1", rc7 == 1)
+        check("names FLASHAIR_IP", "FLASHAIR_IP" in out7)
     finally:
         server.shutdown()
         shutil.rmtree(root, ignore_errors=True)

@@ -31,8 +31,9 @@ Configuration (.env file in the same directory as this script):
                                         (APPMODE station mode) to join an AP the Pi can
                                         already reach, and is polled at FLASHAIR_IP with
                                         no WiFi hop. Requires an explicit FLASHAIR_IP;
-                                        FLASHAIR_SSID/FLASHAIR_PASSWORD/HOME_* are
-                                        unused. See docs/appmode5-sta.md.
+                                        FLASHAIR_SSID/FLASHAIR_PASSWORD/HOME_PASSWORD
+                                        are unused (HOME_SSID, if set, keeps the
+                                        uplink self-heal). See docs/appmode5-sta.md.
 
     # Optional screenshot path (BMP from card's /Screenshot/ dir).
     # All three must be set together or all left unset.
@@ -182,7 +183,10 @@ def load_config() -> Config:
     env = _read_env()
 
     def _get(key: str, default: str = "") -> str:
-        return os.environ.get(key, "") or env.get(key, "") or default
+        # strip() the environment path so both config sources behave the
+        # same (_read_env already strips .env values) — a whitespace-padded
+        # env var would otherwise pass validation and poison URLs.
+        return os.environ.get(key, "").strip() or env.get(key, "") or default
 
     cfg = Config(
         flashair_ssid=_get("FLASHAIR_SSID"),
@@ -207,8 +211,9 @@ def load_config() -> Config:
         log.error(f"LINK_MODE must be 'ap' or 'sta', got {cfg.link_mode!r}")
         sys.exit(1)
 
-    # In sta mode there is no WiFi hop, so the card/home WiFi credentials
-    # are unused — but the card is no longer at the well-known 192.168.0.1,
+    # In sta mode there is no WiFi hop, so the card WiFi credentials are
+    # unused (HOME_SSID stays optional — consulted only by the uplink
+    # self-heal) — but the card is no longer at the well-known 192.168.0.1,
     # so FLASHAIR_IP must be set explicitly (the card's static DHCP lease).
     required = [
         "flashair_dir", "local_csv_dir", "remote_host",
@@ -1111,7 +1116,12 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
             # STA mode: the card joins the local AP whenever the avionics
             # powers it — the radio never leaves the home network, so
             # detection is a single HTTP probe (see docs/appmode5-sta.md).
-            if not current:
+            if not current and cfg.home_ssid:
+                # Uplink self-heal — only meaningful when there's a home
+                # network to rejoin by name. With HOME_SSID unset (allowed
+                # in sta mode: ethernet uplink, or wlan0 not ours to manage)
+                # reconnect_home's "connected" check would degenerate to
+                # "" == "" and declare instant success.
                 log.warning("WiFi disconnected. Attempting to reconnect home...")
                 reconnect_home(cfg)
                 _status_set_ssid(get_current_ssid(iface))
@@ -1123,7 +1133,7 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
                 log.info(f"FlashAir reachable at {cfg.flashair_ip} (sta mode).")
                 card_linked = True
             else:
-                log.debug(f"FlashAir not reachable at {cfg.flashair_ip} (card powered off?).")
+                log.debug(f"FlashAir not reachable at {cfg.flashair_ip} (card powered off, or AP down?).")
         elif current == cfg.flashair_ssid:
             log.info("Already on FlashAir (recovery from previous run).")
             card_linked = True
