@@ -20,6 +20,8 @@ Optionally also syncs BMP screenshots from the card's `/Screenshot/` directory (
 6. **Transfer** — SCPs the new files to the remote server.
 7. **Cleanup** — Deletes old local CSVs, keeping the 10 most recent.
 
+This describes the default `LINK_MODE=ap`. With `LINK_MODE=sta` the card joins a local AP instead and steps 1–3 and 5 collapse into a single HTTP probe — see [Optional: station-mode link](#optional-station-mode-link-link_modesta).
+
 A file lock prevents concurrent runs. If the script is triggered while another instance is active, the new invocation exits silently.
 
 If the script crashes mid-sync while on FlashAir WiFi, a `try/finally` ensures it always attempts to reconnect home. On the next cycle, if the Pi is disconnected, it reconnects before doing anything else.
@@ -206,6 +208,7 @@ sudo crontab -e
 | `WIFI_INTERFACE` | No | `wlan0` | WiFi interface name |
 | `COOLDOWN_MINUTES` | No | `30` | Minutes to wait before re-checking FlashAir |
 | `POLL_SECONDS` | No | `60` | Daemon poll interval in seconds |
+| `LINK_MODE` | No | `ap` | `ap` = hop onto the card's own AP. `sta` = the card joins a local AP and is polled at `FLASHAIR_IP` (then required) — no WiFi hop. See [docs/appmode5-sta.md](docs/appmode5-sta.md). |
 | `FLASHAIR_SHOT_DIR` | No | — | Card dir holding BMP screenshots (e.g. `/Screenshot`). Required if any screenshot var is set. |
 | `LOCAL_SHOT_DIR` | No | — | Tmpfs staging dir on the Pi (e.g. `/run/flashair-shots`). Required if any screenshot var is set. |
 | `REMOTE_SHOT_DIR` | No | — | Destination dir on the remote server for BMPs. Required if any screenshot var is set. |
@@ -226,6 +229,17 @@ Differences from the CSV path:
 
 If none of the `*_SHOT_DIR` vars are set, this path is inert — existing CSV-only setups see no behaviour change.
 
+## Optional: station-mode link (LINK_MODE=sta)
+
+By default the card acts as its own WiFi access point and the sync host must leave its network to reach it (`LINK_MODE=ap`, the flow described above). The card can instead be reconfigured — `APPMODE` station mode in its `/SD_WLAN/CONFIG` file — to **join** an AP the sync host can already reach (for example a hostapd AP hosted on the Pi itself). The host's radio then never moves:
+
+1. **Detect** — one short HTTP probe of `FLASHAIR_IP` (give the card a static DHCP lease). The card associates and answers whenever the device it sits in powers it.
+2. **Download / Transfer / Cleanup** — identical to AP mode: same watermarks, stability check, lookback rescue, SCP phase, cooldown.
+
+Benefits: no internet/SSH dropout during syncs, detection in seconds instead of a scan cycle, and the `wpa_cli` hop machinery goes unused. In `sta` mode `FLASHAIR_IP` is required, and `FLASHAIR_SSID` / `FLASHAIR_PASSWORD` / `HOME_SSID` / `HOME_PASSWORD` are unused.
+
+Card-side setup (CONFIG editing runbook, DHCP reservation, timeout tuning, rollback) is documented in [docs/appmode5-sta.md](docs/appmode5-sta.md). `LINK_MODE=ap` remains the default; existing setups see no behaviour change.
+
 ## Status file
 
 When running in `--daemon` mode the script writes its current sync status to `/run/heater-flashair.json` (tmpfs) on every state change — stage transitions, per-file progress, sync session completions. Writes are atomic (`temp + os.replace`), 0664 perms so a non-owner consumer (e.g. Apache mod_wsgi running as `www-data` on the same host) can read it.
@@ -245,6 +259,7 @@ Example contents (mid-cycle, downloading the 3rd of 7 CSVs while 5 BMPs wait the
   "last_shot_sync_epoch": 1779302195,
   "last_shot_sync_files_n": 4,
   "current_ssid": "FlashAir-Card",
+  "link_mode": "ap",
   "transferring": true,
   "current_file": "log_YYYYMMDD_HHMMSS_KXXX.csv"
 }
@@ -261,6 +276,7 @@ Fields:
 - `last_sync_files_n` — count of CSVs actually downloaded in that most-recent reach-the-card cycle. Resets to `0` across daemon restart.
 - `last_shot_sync_epoch` / `last_shot_sync_files_n` — parallel of the above for the BMP pipeline. `null` / `0` until the first shot cycle since daemon restart.
 - `current_ssid` — WiFi network the daemon is currently associated to (`wpa_cli status` query). `null` when not associated. Updated at cycle start, after a FlashAir association, and after each `reconnect_home()` call — so a consumer can see the radio physically hopping from hangar SSID to FlashAir SSID and back as proof the wifi side is healthy.
+- `link_mode` — `"ap"` or `"sta"` (`null` until the first cycle). In `sta` mode the radio never hops, so `current_ssid` stays parked on the home network the whole time — consumers keying an "on FlashAir" state off `current_ssid` should use `stage != "idle"` instead.
 - `transferring` — `true` while a `download_file()` or SCP is in-flight. Retained for back-compat with v0 consumers (use `stage != "idle"` for the same signal in the new contract).
 - `current_file` — filename being transferred, else `null`.
 
@@ -296,6 +312,7 @@ Consumers should treat the file as stale if it's missing or if `now - epoch > 12
 flashair_sync.py        Main script (one-shot and daemon modes)
 flashair-sync.service   systemd unit file
 flashair_cron.sh        Shell wrapper for cron
+docs/appmode5-sta.md    Station-mode (LINK_MODE=sta) design doc + card runbook
 .env                    Configuration (not in git)
 .env.example            Example configuration
 .gitignore              Git exclusions

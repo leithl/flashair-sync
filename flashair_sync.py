@@ -26,6 +26,13 @@ Configuration (.env file in the same directory as this script):
     WIFI_INTERFACE=wlan0                WiFi interface (default: wlan0)
     COOLDOWN_MINUTES=30                 Minutes to wait before re-checking FlashAir (default: 30)
     POLL_SECONDS=60                     Daemon poll interval in seconds (default: 60)
+    LINK_MODE=ap                        "ap" (default): hop onto the card's own AP to
+                                        download. "sta": the card has been reconfigured
+                                        (APPMODE station mode) to join an AP the Pi can
+                                        already reach, and is polled at FLASHAIR_IP with
+                                        no WiFi hop. Requires an explicit FLASHAIR_IP;
+                                        FLASHAIR_SSID/FLASHAIR_PASSWORD/HOME_* are
+                                        unused. See docs/appmode5-sta.md.
 
     # Optional screenshot path (BMP from card's /Screenshot/ dir).
     # All three must be set together or all left unset.
@@ -66,6 +73,10 @@ log = logging.getLogger("flashair_sync")
 FLASHAIR_DEFAULT_IP = "192.168.0.1"
 SCAN_WAIT_SECONDS = 5
 CONNECT_TIMEOUT = 30
+# STA-mode reachability probe. Short on purpose: "card powered off" is the
+# common case at the hangar, and each daemon poll eats the full timeout when
+# nothing answers at FLASHAIR_IP.
+STA_PROBE_TIMEOUT = 5
 FLASHAIR_HTTP_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 120
 COOLDOWN_MINUTES_DEFAULT = 30
@@ -146,6 +157,10 @@ class Config:
     remote_dir: str
     ssh_key_path: str = ""
     wifi_interface: str = ""
+    # "ap" = hop onto the card's own AP (default); "sta" = the card is a
+    # station on an AP this host can already reach, polled at flashair_ip
+    # with no WiFi hop (see docs/appmode5-sta.md).
+    link_mode: str = "ap"
     # Screenshot path (opt-in; all three must be set together)
     flashair_shot_dir: str = ""
     local_shot_dir: str = ""
@@ -182,19 +197,32 @@ def load_config() -> Config:
         remote_dir=_get("REMOTE_DIR"),
         ssh_key_path=_get("SSH_KEY_PATH"),
         wifi_interface=_get("WIFI_INTERFACE"),
+        link_mode=_get("LINK_MODE", "ap").strip().lower(),
         flashair_shot_dir=_get("FLASHAIR_SHOT_DIR"),
         local_shot_dir=_get("LOCAL_SHOT_DIR"),
         remote_shot_dir=_get("REMOTE_SHOT_DIR"),
     )
 
-    missing = []
-    for field_name in [
-        "flashair_ssid", "flashair_password", "flashair_dir",
-        "home_ssid", "local_csv_dir", "remote_host",
+    if cfg.link_mode not in ("ap", "sta"):
+        log.error(f"LINK_MODE must be 'ap' or 'sta', got {cfg.link_mode!r}")
+        sys.exit(1)
+
+    # In sta mode there is no WiFi hop, so the card/home WiFi credentials
+    # are unused — but the card is no longer at the well-known 192.168.0.1,
+    # so FLASHAIR_IP must be set explicitly (the card's static DHCP lease).
+    required = [
+        "flashair_dir", "local_csv_dir", "remote_host",
         "remote_user", "remote_dir",
-    ]:
+    ]
+    if cfg.link_mode == "ap":
+        required += ["flashair_ssid", "flashair_password", "home_ssid"]
+
+    missing = []
+    for field_name in required:
         if not getattr(cfg, field_name):
             missing.append(field_name.upper())
+    if cfg.link_mode == "sta" and not _get("FLASHAIR_IP"):
+        missing.append("FLASHAIR_IP")
     if missing:
         log.error(f"Missing required config: {', '.join(missing)}")
         sys.exit(1)
@@ -344,6 +372,12 @@ _status: dict = {
     # (grey) vs "no wifi" (red), letting the user see at a glance whether
     # the radio actually hopped to the expected network.
     "current_ssid": None,
+
+    # Link mode this cycle ran under ("ap" | "sta"; None until the first
+    # cycle). In sta mode the radio never hops, so consumers keying an
+    # "on FlashAir" state off current_ssid should treat stage != idle as
+    # the activity signal instead.
+    "link_mode": None,
 
     # Back-compat with the v0 contract — older consumers (pre-stage) read these.
     # `transferring=True` whenever stage is any of the four active transfer stages.
@@ -587,6 +621,24 @@ def wait_for_flashair(cfg: Config) -> bool:
         time.sleep(1)
     log.error(f"FlashAir HTTP not reachable within {CONNECT_TIMEOUT}s")
     return False
+
+
+def probe_flashair(cfg: Config) -> bool:
+    """STA mode: one quick HTTP probe — is the card awake on the LAN?
+
+    In sta link mode the card associates to an AP this host can already
+    reach whenever the avionics powers it, so card detection is a single
+    cheap GET instead of a WiFi scan-and-hop. One attempt, short timeout:
+    unlike wait_for_flashair (called right after a deliberate association,
+    where the card is known to be booting), a failed probe just means "no
+    card right now" and the next poll cycle retries.
+    """
+    url = f"http://{cfg.flashair_ip}/command.cgi?op=100&DIR=/"
+    try:
+        with urllib.request.urlopen(url, timeout=STA_PROBE_TIMEOUT) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1043,8 +1095,10 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
         iface = cfg.wifi_interface
         current = get_current_ssid(iface)
         _status_set_ssid(current)
+        with _status_lock:
+            _status["link_mode"] = cfg.link_mode
         net_id = None
-        already_on_flashair = (current == cfg.flashair_ssid)
+        card_linked = False  # card confirmed reachable this cycle (either mode)
 
         # Status: count successful FlashAir HTTP downloads this run; used by
         # /status to answer "did all the CSVs come off the card?".
@@ -1053,8 +1107,26 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
         reached_card = False
 
         # --- Phase 1: Download from FlashAir (if available) ---
-        if already_on_flashair:
+        if cfg.link_mode == "sta":
+            # STA mode: the card joins the local AP whenever the avionics
+            # powers it — the radio never leaves the home network, so
+            # detection is a single HTTP probe (see docs/appmode5-sta.md).
+            if not current:
+                log.warning("WiFi disconnected. Attempting to reconnect home...")
+                reconnect_home(cfg)
+                _status_set_ssid(get_current_ssid(iface))
+                # The card sits on a different interface than the home
+                # uplink, so a dead uplink doesn't block the probe below.
+            if _in_cooldown() and not resync and not bypass_cooldown:
+                log.debug(f"In cooldown (last sync < {_cooldown_minutes()}m ago), skipping FlashAir.")
+            elif probe_flashair(cfg):
+                log.info(f"FlashAir reachable at {cfg.flashair_ip} (sta mode).")
+                card_linked = True
+            else:
+                log.debug(f"FlashAir not reachable at {cfg.flashair_ip} (card powered off?).")
+        elif current == cfg.flashair_ssid:
             log.info("Already on FlashAir (recovery from previous run).")
+            card_linked = True
         elif _in_cooldown() and not resync and not bypass_cooldown:
             log.debug(f"In cooldown (last sync < {_cooldown_minutes()}m ago), skipping FlashAir.")
         elif not current:
@@ -1066,14 +1138,17 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
             # On home WiFi — scan for FlashAir
             if scan_for_ssid(iface, cfg.flashair_ssid):
                 net_id = connect_to_flashair(cfg)
-                already_on_flashair = True
+                card_linked = True
                 _status_set_ssid(get_current_ssid(iface))
             else:
                 log.debug(f"FlashAir '{cfg.flashair_ssid}' not in range.")
 
-        if already_on_flashair or net_id is not None:
+        if card_linked:
             try:
-                if not wait_for_flashair(cfg):
+                # In sta mode probe_flashair already proved HTTP works; in
+                # ap mode we just associated and the card may still be
+                # bringing its server up.
+                if not (cfg.link_mode == "sta" or wait_for_flashair(cfg)):
                     log.error("Cannot reach FlashAir HTTP server.")
                 else:
                     reached_card = True
@@ -1314,8 +1389,11 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
                         except Exception as e:
                             log.error(f"Screenshot download phase failed: {e}")
             finally:
-                reconnect_home(cfg, net_id)
-                _status_set_ssid(get_current_ssid(iface))
+                if cfg.link_mode == "ap":
+                    # Only the ap hop moves the radio; in sta mode there is
+                    # nothing to reconnect from.
+                    reconnect_home(cfg, net_id)
+                    _status_set_ssid(get_current_ssid(iface))
                 _status_clear_transferring()
                 if reached_card:
                     _status_record_sync(session_downloads)
@@ -1365,7 +1443,7 @@ def run(resync: bool = False, _lock=None, bypass_cooldown: bool = False) -> bool
                 transferred, len(to_scp),
                 shots_transferred, len(pending_shots),
             )
-        elif did_work or (already_on_flashair or net_id is not None):
+        elif did_work or card_linked:
             log.info("Sync complete.")
         else:
             log.debug("Sync complete (no-op).")
