@@ -16,6 +16,11 @@ Three-phase sync cycle, run either as a systemd daemon (recommended) or via cron
 2. **Transfer** — SCP CSVs to the CSV destination, then SCP staged BMPs to `REMOTE_SHOT_DIR`. Each successful BMP SCP advances `LAST_SHOT_SCPD` and immediately deletes the staged copy (the downstream host keeps originals).
 3. **Cleanup** — Delete already-synced local CSVs, keeping the 10 most recent. (BMPs are cleaned up inline in step 2.)
 
+Two link modes for step 1 (`LINK_MODE` in `.env`, default `ap`):
+
+- **ap** (default) — the card is its own AP. The Pi's `wlan0` leaves the home network (wpa_cli scan → temporary network → download → `try/finally` reconnect). Internet/SSH on the Pi die for the duration of every hop.
+- **sta** — the card has been reconfigured (`APPMODE` station mode — design doc + card runbook in `docs/appmode5-sta.md`) to join an AP the Pi already hosts/reaches (e.g. a hostapd `uap0`). Step 1's detection is a single short HTTP probe of the card's static DHCP lease (`FLASHAIR_IP`, required in this mode); the radio never moves and the `wpa_cli` hop machinery goes unused (`wpa_cli` itself still runs for the cycle-start SSID sample and, when `HOME_SSID` is set, the uplink self-heal). Watermarks, stability check, lookback rescue, SCP, and cooldown logic are identical in both modes. `FLASHAIR_SSID`/`FLASHAIR_PASSWORD`/`HOME_PASSWORD` are unused in sta mode.
+
 Key mechanisms:
 - **Watermarks** (`LAST_SYNCED`, `LAST_SCPD` for CSVs; `LAST_SHOT_SCPD` for BMPs) in `.env` track progress across restarts. Files sort lexicographically by name = chronologically.
 - **Cooldown** (`.last_sync` file mtime) prevents re-scanning FlashAir for 30 min after a successful download. Only set on *complete* downloads — partial failures retry promptly.
@@ -37,6 +42,9 @@ Key mechanisms:
       "last_shot_sync_epoch": <int|null>,
       "last_shot_sync_files_n": <int>,
       "current_ssid": <str|null>,   // current wpa_cli SSID; null = not associated
+      "link_mode": <str|null>,      // "ap" | "sta"; null until first cycle. In sta
+                                    // mode current_ssid never hops — key "on
+                                    // FlashAir" off stage != "idle" instead.
       "transferring": <bool>,       // back-compat with v0 consumers
       "current_file": <str|null>    // back-compat
     }
@@ -50,6 +58,7 @@ flashair_sync.py          Main script (Linux/RPi, tracked in git)
 flashair_sync_macos.py    macOS testing variant (NOT in git, see .gitignore)
 flashair_cron.sh          Shell wrapper for cron
 flashair-sync.service     systemd unit file
+docs/appmode5-sta.md      LINK_MODE=sta design doc + card CONFIG runbook
 .env.example              Configuration template
 .env                      Actual config (not in git, has watermark state)
 ```
@@ -82,6 +91,7 @@ The SCP destination in this project's `.env` (`REMOTE_DIR`) must be the same pat
 - **Reset watermarks**: edit `LAST_SYNCED=`, `LAST_SCPD=`, `LAST_SHOT_SCPD=` in `.env`
 - **Change poll/cooldown**: edit `POLL_SECONDS` / `COOLDOWN_MINUTES` in `.env`, restart daemon
 - **Enable screenshots**: set `FLASHAIR_SHOT_DIR=/Screenshot`, `LOCAL_SHOT_DIR=/run/flashair-shots`, `REMOTE_SHOT_DIR=<path>` (all three or none), restart daemon
+- **Switch to station-mode link**: follow `docs/appmode5-sta.md` end to end (card CONFIG edit at a laptop + dnsmasq static lease + `LINK_MODE=sta` / `FLASHAIR_IP` in `.env`), restart daemon. Do not flip `LINK_MODE` before the card CONFIG is changed — the probe would just time out every cycle.
 
 ## Public repo — keep contributions standalone
 
