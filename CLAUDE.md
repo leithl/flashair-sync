@@ -91,7 +91,8 @@ The SCP destination in this project's `.env` (`REMOTE_DIR`) must be the same pat
 - **Reset watermarks**: edit `LAST_SYNCED=`, `LAST_SCPD=`, `LAST_SHOT_SCPD=` in `.env`
 - **Change poll/cooldown**: edit `POLL_SECONDS` / `COOLDOWN_MINUTES` in `.env`, restart daemon
 - **Enable screenshots**: set `FLASHAIR_SHOT_DIR=/Screenshot`, `LOCAL_SHOT_DIR=/run/flashair-shots`, `REMOTE_SHOT_DIR=<path>` (all three or none), restart daemon
-- **Switch to station-mode link**: follow `docs/appmode5-sta.md` end to end (card CONFIG edit at a laptop + dnsmasq static lease + `LINK_MODE=sta` / `FLASHAIR_IP` in `.env`), restart daemon. Do not flip `LINK_MODE` before the card CONFIG is changed — the probe would just time out every cycle.
+- **Switch to station-mode link**: follow `docs/appmode5-sta.md` end to end (card CONFIG edit at a laptop + dnsmasq static lease + `LINK_MODE=sta` / `FLASHAIR_IP` in `.env`), restart daemon. Do not flip `LINK_MODE` before the card CONFIG is changed — the probe would just time out every cycle. Observed cutover numbers (latency, card firmware) in §12.
+- **Read the live (still-growing) log** (sta mode only): plain GET of the newest file off the card at `FLASHAIR_IP` — one-liner in `docs/appmode5-sta.md` §13. Read-only, safe while the host device writes.
 
 ## Public repo — keep contributions standalone
 
