@@ -238,6 +238,8 @@ By default the card acts as its own WiFi access point and the sync host must lea
 
 Benefits: no internet/SSH dropout during syncs, detection in seconds instead of a scan cycle, and the `wpa_cli` hop machinery goes unused (`wpa_cli` itself still runs for the status-file SSID sample and the uplink self-heal). In `sta` mode `FLASHAIR_IP` is required; `FLASHAIR_SSID` / `FLASHAIR_PASSWORD` / `HOME_PASSWORD` are unused, and `HOME_SSID` is optional — when set, the daemon still self-heals its WiFi uplink if `wlan0` drops off the home network.
 
+A side effect: since the card is reachable whenever it's powered, you can pull the still-growing log off it at any time with a plain HTTP GET (see §13 of the design doc).
+
 Card-side setup (CONFIG editing runbook, DHCP reservation, timeout tuning, rollback) is documented in [docs/appmode5-sta.md](docs/appmode5-sta.md). `LINK_MODE=ap` remains the default; existing setups see no behaviour change.
 
 ## Status file

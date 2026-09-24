@@ -1,9 +1,10 @@
 # Station-mode link (`LINK_MODE=sta`): design + card runbook
 
-**Status: DESIGNED, not yet cut over.** The code side ships behind the `LINK_MODE`
-flag (default `ap` — zero behaviour change until flipped). The card side requires a
-one-time `CONFIG` edit at a laptop, documented in §5. Do the card edit and the `.env`
-flip together, per the cutover order in §7.
+**Status: CUT OVER on the reference install, 2026-09-24** — observed results in
+§12. The code side ships behind the `LINK_MODE` flag (default `ap` — zero behaviour
+change until flipped). The card side requires a one-time `CONFIG` edit at a laptop,
+documented in §5. Do the card edit and the `.env` flip together, per the cutover
+order in §8.
 
 > Placeholders: `<card-mac>` is the card's WiFi MAC (the hex tail of its factory
 > default SSID, `flashair_XXXXXXXXXXXX`), `<ap-ssid>` / `<ap-passphrase>` are the
@@ -379,16 +380,53 @@ verification (§8 step 7) happens before leaving the site.
 
 ## 11. Open questions
 
-- **Rejoin latency after power-on is unmeasured** — community reports show the
-  card "just appearing" with a lease shortly after power-up, but nobody published
-  numbers. The poller already tolerates this (a probe every `POLL_SECONDS`);
-  budget tens of seconds, and record the observed figure during cutover.
-- **Card model/firmware unknown until cutover** — record `op=108` (or the
-  `VERSION=` CONFIG line) per §4.1 while on site. If it's a W-04 below 4.00.02,
-  note the STA-mode WPA2 advisory in §4.1.
-- Whether to later shorten `COOLDOWN_MINUTES` / `POLL_SECONDS` in sta mode — probing
-  is nearly free now, so fresher detection is affordable. Left at defaults for the
-  cutover; tune after observing real cycles.
-- The status-file consumer's "on FlashAir" indicator keys off `current_ssid`, which
-  never hops in sta mode — it should move to `stage != "idle"` (tracked on the
-  consumer side; the additive `link_mode` field is the hint).
+- ~~Rejoin latency after power-on is unmeasured~~ — **resolved at cutover**: the
+  card was answering HTTP within seconds of associating (§12).
+- ~~Card model/firmware unknown until cutover~~ — **resolved**: W-03, firmware
+  3.00.01 on the reference card (§12). The W-04 advisory in §4.1 doesn't apply to it.
+- Whether to shorten `COOLDOWN_MINUTES` / `POLL_SECONDS` in sta mode — probing is
+  nearly free now, so fresher detection is affordable. The reference install runs
+  a 3-minute cooldown without issue.
+- The status-file consumer's "on FlashAir" indicator should key off
+  `stage != "idle"`, not `current_ssid` (which never hops in sta mode). Consumer-side;
+  the additive `link_mode` field is the hint.
+
+## 12. Cutover record (2026-09-24)
+
+First cutover, on a Pi Zero W whose `uap0` AP (hostapd, 2.4 GHz channel 3,
+WPA2-PSK/CCMP) shares its single radio with the `wlan0` uplink.
+
+- **Card**: `op=108` → `FA9CAW3AW3.00.01` — W-03, firmware 3.00.01.
+- **MAC heuristic held**: the first association's MAC matched the factory-SSID
+  tail, so the pre-staged `dhcp-host` line (§6.1) handed out the reserved IP on
+  the very first join.
+- **Rejoin latency**: DHCPACK within ~2 s of association, and `op=108` answering
+  within ~3 s of association. Three clean joins — first station-mode boot plus the
+  two §8 step 5 power cycles.
+- **`STA_RETRY_CT` was not set** in this cutover (the edit changed `APPMODE` /
+  `APPSSID` / `APPNETWORKKEY`; `MASTERCODE` was already present). The card's
+  default retry behaviour has been fine so far. Add `STA_RETRY_CT=0` at the next
+  card edit if joins ever prove flaky after a host reboot.
+- **First sta-mode sync**: two closed logs (~1.4 MB) listed and downloaded in
+  ~2 s; SCP succeeded on the first attempt.
+- **What the hop had been costing** (measured just before cutover): each ap-mode
+  sync took the `wlan0` uplink offline for ~1.7 min (join + the 90 s stability
+  check + reconnect), and the first SCP after reconnecting timed out 3 times in
+  2 days while the uplink's VPN re-established. Clients of the co-hosted `uap0` AP
+  stayed associated through every hop — the uplink was the only casualty.
+
+## 13. Reading the live log
+
+In sta mode the card is reachable whenever its host device is powered, so the
+still-growing CSV can be fetched ad hoc from anything on the AP's LAN. It's a
+plain read — the FAT-cache hazard in §5.1 concerns card-side *writes*, not reads —
+and returns whatever the host device has flushed so far. The card lists files in
+directory (creation) order, so the newest is last:
+
+```
+f=$(curl -s "http://<card-ip>/command.cgi?op=100&DIR=/data_log" | tail -1 | cut -d, -f2)
+curl -s "http://<card-ip>/data_log/$f" > live.csv
+```
+
+Substitute your `FLASHAIR_DIR` for `/data_log`. The daemon's own pipeline still
+waits for a log to close before syncing it (stability check, §7).
